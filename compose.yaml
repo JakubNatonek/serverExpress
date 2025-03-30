@@ -1,0 +1,29 @@
+version: '1.0'
+
+services:
+  backend:
+    build: .
+    ports:
+      - '8080:8080'
+    volumes:
+      - express_data:/app
+  db: 
+    image: mysql:latest
+    ports:
+      - '33060:33060'
+    environment:
+      MYSQL_ROOT_PASSWORD: pass
+      MYSQL_DATABASE: mydb
+    volumes:
+      - mysql_data:/var/lib/mysql
+  frontend:
+    build: E:\Projects\ionic\MaxiTaxi
+    ports:
+      - '5173:5173'
+    volumes:
+      - ionic_data:/app
+
+volumes:
+  mysql_data:
+  express_data:
+  ionic_data:
