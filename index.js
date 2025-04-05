@@ -1,4 +1,6 @@
 const express =  require('express');
+const mysql = require('mysql2/promise');
+require('dotenv').config();
 const app = express();
 const port = process.env.PORT || 8080;
 
@@ -8,22 +10,33 @@ app.use(cors({ origin: 'http://localhost:8100' }));
 
 app.use(express.json());
 
+async function connectDB() {
+  const connection = await mysql.createConnection({
+    host: process.env.DB_HOST,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME,
+  });
+  return connection;
+}
+
 app.listen(
     port,
     () => console.log(`http://localhost:${port}`)
 );
 
-app.get('/test', (req, res) => {
-    res.status(200).send({
-        users:["userOne", "userTwo", "userThre"]
-    });
+
+app.get('/users', async (req, res) => {
+  try {
+    const connection = await connectDB();
+    const [rows] = await connection.execute('SELECT * FROM uzytkownicy');
+    res.json(rows);
+  } catch (err) {
+    console.error('Error fetching data: ', err);
+    res.status(500).send('Server Error');
+  }
 });
 
-// Przykładowa tabela użytkowników i haseł
-const table = {
-    users: ["ww@ww.pl"],
-    passw: ["123456"]
-  };
 
 const crypto = require("crypto");
 const secretKey = Buffer.from("my_secret_key_16"); // 16 bajtów
