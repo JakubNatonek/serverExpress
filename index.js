@@ -5,8 +5,8 @@ const app = express();
 const port = process.env.PORT || 8080;
 
 const cors = require('cors');
-app.use(cors());
-app.use(cors({ origin: 'http://localhost:8100' }));
+app.use(cors()); //wszystko
+app.use(cors({ origin: 'http://localhost:8100' })); //apka
 
 app.use(express.json());
 
@@ -107,6 +107,51 @@ app.post("/register", async (req, res) => {
     } catch (err) {
       console.error('Błąd podczas dodawania użytkownika:', err);
       return res.status(500).json({ message: 'Wystąpił błąd podczas dodawania użytkownika' });
+    }
+
+  } catch (error) {
+    console.error("Decryption error:", error);
+    return res.status(500).json({ message: "Błąd dekodowania danych" });
+  }
+});
+
+const login_user = async (email, haslo_hash) => {
+  const connection = await connectDB();
+  const query = 'SELECT COUNT(*) AS count FROM uzytkownicy WHERE email = ? AND haslo_hash = ?';
+
+  try {
+    const [results] = await connection.execute(query, [email, haslo_hash]);
+    await connection.end();
+    return results[0].count > 0; // Return true if user exists
+  } catch (err) {
+    await connection.end();
+    throw err; // Rethrow error to be handled by the caller
+  }
+};
+
+app.post("/login", async (req, res) => {
+  try {
+    console.log("Incoming request body:", req.body);
+    const { iv, data } = req.body;
+    const decryptedData = decryptData(iv, data);
+    console.log("Decrypted user data:", decryptedData);
+
+    const email = decryptedData.user;
+    const haslo_hash = decryptedData.password;
+
+    try {
+      const result = await login_user(email, haslo_hash);
+      
+      if (!result) {
+        return res.status(400).json({ message: 'Niepoprawny adres e-mail lub hasło.' });
+      }
+  
+      // If user does exist
+      return res.status(200).json({ message: 'Zalogowano pomyślnie!', result });
+
+    } catch (err) {
+      console.error('Login error:', err);
+      return res.status(500).json({ message: 'Wystąpił błąd podczas logowania' });
     }
 
   } catch (error) {
