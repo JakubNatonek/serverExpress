@@ -1,5 +1,6 @@
 const express =  require('express');
 const mysql = require('mysql2/promise');
+
 require('dotenv').config();
 const app = express();
 const port = process.env.PORT || 8080;
@@ -7,6 +8,14 @@ const port = process.env.PORT || 8080;
 const cors = require('cors');
 app.use(cors()); //wszystko
 app.use(cors({ origin: 'http://localhost:8100' })); //apka
+
+const jwt = require("jsonwebtoken"); // JSON web token -------------------
+
+const JWT_SECRET = process.env.JWT_SECRET; 
+
+function generateToken(email) {
+  return jwt.sign({ email }, JWT_SECRET, { expiresIn: "1h" }); // Token ważny przez 1 godzinę
+}
 
 app.use(express.json());
 
@@ -26,11 +35,11 @@ app.listen(
 );
 
 const crypto = require("crypto");
-const secretKey = Buffer.from("my_secret_key_16"); // 16 bajtów
+const secretKey = process.env.SECRET_KEY;
 
 function decryptData(iv, encryptedData) {
-  console.log("Received IV:", iv);
-  console.log("Received Encrypted Data:", encryptedData);
+  //console.log("Received IV:", iv);
+  //console.log("Received Encrypted Data:", encryptedData);
   const decipher = crypto.createDecipheriv("aes-128-cbc", secretKey, Buffer.from(iv));
   let decrypted = decipher.update(Buffer.from(encryptedData));
   decrypted = Buffer.concat([decrypted, decipher.final()]);
@@ -131,10 +140,11 @@ const login_user = async (email, haslo_hash) => {
 
 app.post("/login", async (req, res) => {
   try {
-    console.log("Incoming request body:", req.body);
+    //console.log("Incoming request body:", req.body);
     const { iv, data } = req.body;
     const decryptedData = decryptData(iv, data);
     console.log("Decrypted user data:", decryptedData);
+	
 
     const email = decryptedData.user;
     const haslo_hash = decryptedData.password;
@@ -146,8 +156,16 @@ app.post("/login", async (req, res) => {
         return res.status(400).json({ message: 'Niepoprawny adres e-mail lub hasło.' });
       }
   
-      // If user does exist
-      return res.status(200).json({ message: 'Zalogowano pomyślnie!', result });
+      // Generowanie tokena JWT
+      const token = generateToken(email);
+
+      // Zwrócenie tokena do klienta
+      // Logowanie wygenerowanego tokena
+      console.log("Generated JWT Token:", token);
+      console.log("ENV JWT KEY:", JWT_SECRET);
+
+      return res.status(200).json({ message: 'Zalogowano pomyślnie!', token });
+
 
     } catch (err) {
       console.error('Login error:', err);
@@ -158,4 +176,36 @@ app.post("/login", async (req, res) => {
     console.error("Decryption error:", error);
     return res.status(500).json({ message: "Błąd dekodowania danych" });
   }
+
 });
+
+
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers.authorization;
+  const token = authHeader && authHeader.split(" ")[1];
+
+  if (!token) {
+    return res.status(401).json({ message: "Brak tokena" });
+  }
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(403).json({ message: "Nieprawidłowy token" });
+    }
+    req.user = user; // Dodanie danych użytkownika do obiektu `req`
+    next();
+  });
+}
+
+
+app.get('/users', authenticateToken, async (req, res) => {
+  try {
+    const connection = await connectDB();
+    const [rows] = await connection.execute('SELECT * FROM uzytkownicy');
+    await connection.end();
+    res.json(rows);
+  } catch (err) {
+    console.error('Error fetching data: ', err);
+    res.status(500).send('Server Error');
+  }
+});
+
