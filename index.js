@@ -1,6 +1,7 @@
 const express = require("express");
+const http = require("http");
+const { Server } = require("socket.io");
 const mysql = require("mysql2/promise");
-
 require("dotenv").config();
 const app = express();
 const port = process.env.PORT || 8080;
@@ -28,8 +29,6 @@ async function connectDB() {
   });
   return connection;
 }
-
-app.listen(port, () => console.log(`http://localhost:${port}`));
 
 const crypto = require("crypto");
 const secretKey = process.env.SECRET_KEY;
@@ -455,6 +454,22 @@ app.post("/zlecenia", authenticateToken, async (req, res) => {
         .json({ message: "Masz już aktywny przejazd. Nie możesz zamówić nowego." });
     }
 
+    // Sprawdzenie, czy kierowca ma już przejazd o statusie 2
+    const checkDriverQuery = `
+      SELECT COUNT(*) AS activeDriverRides
+      FROM przejazdy
+      WHERE kierowca_id = ? AND status_id = 2
+    `;
+    const [driverResult] = await connection.execute(checkDriverQuery, [kierowca_id]);
+
+    if (driverResult[0].activeDriverRides > 0) {
+      await connection.end();
+      return res
+        .status(400)
+        .json({ message: "Wybrany kierowca ma już aktywny przejazd. Nie można przypisać nowego." });
+    }
+
+
     // Dodanie nowego przejazdu
     const query = `
       INSERT INTO przejazdy (pasazer_id, kierowca_id, dystans_km, trasa_przejazdu, cena, data_zamowienia, status_id)
@@ -482,4 +497,215 @@ app.post("/zlecenia", authenticateToken, async (req, res) => {
     res.status(500).json({ message: "Błąd dekodowania danych" });
   }
 });
+
+app.get("/zlecenia", authenticateToken, async (req, res) => {
+  const userId = req.user.id; // ID użytkownika z tokena
+  const connection = await connectDB();
+
+  const query = `
+    SELECT 
+      p.id AS zlecenie_id,
+      p.pasazer_id,
+      pas.imie AS pasazer_imie, -- Imię pasażera
+      p.kierowca_id,
+      kier.imie AS kierowca_imie, -- Imię kierowcy
+      p.dystans_km,
+      p.trasa_przejazdu,
+      p.cena,
+      p.data_zamowienia,
+      p.data_zakonczenia,
+      s.nazwa AS status
+    FROM przejazdy p
+    JOIN uzytkownicy pas ON p.pasazer_id = pas.id -- Dołączenie danych pasażera
+    JOIN uzytkownicy kier ON p.kierowca_id = kier.id -- Dołączenie danych kierowcy
+    JOIN statusy_przejazdu s ON p.status_id = s.id -- Dołączenie statusu
+    WHERE p.pasazer_id = ? OR p.kierowca_id = ?
+    ORDER BY p.data_zamowienia DESC
+  `;
+
+  try {
+    const [rows] = await connection.execute(query, [userId, userId]);
+    await connection.end();
+    const data = await encryptData(rows);
+    res.status(200).json(data); // Zwraca listę zleceń użytkownika
+  } catch (err) {
+    console.error("Błąd podczas pobierania zleceń:", err);
+    await connection.end();
+    res.status(500).json({ message: "Błąd serwera" });
+  }
+});
+
+app.put("/zlecenia/:id/status", authenticateToken, async (req, res) => {
+  const zlecenieId = req.params.id; // ID zlecenia z parametru URL
+  const { iv, data } = req.body; // Odbieranie zaszyfrowanych danych
+
+  if (!iv || !data) {
+    return res.status(400).json({ message: "Brak danych do zaktualizowania" });
+  }
+
+  try {
+    // Deszyfrowanie danych
+    const decryptedData = decryptData(iv, data);
+    const { status_id } = decryptedData;
+    console.log(decryptedData)
+
+    if (!status_id) {
+      return res.status(400).json({ message: "Brak statusu do zaktualizowania" });
+    }
+
+    const connection = await connectDB();
+    const query = `
+      UPDATE przejazdy
+      SET status_id = ?
+      WHERE id = ?
+    `;
+
+    try {
+      const [result] = await connection.execute(query, [status_id, zlecenieId]);
+      await connection.end();
+
+      if (result.affectedRows === 0) {
+        return res.status(404).json({ message: "Nie znaleziono zlecenia" });
+      }
+
+      res.status(200).json({ message: "Status zlecenia został zaktualizowany" });
+    } catch (err) {
+      console.error("Błąd podczas aktualizowania statusu zlecenia:", err);
+      await connection.end();
+      res.status(500).json({ message: "Błąd serwera" });
+    }
+  } catch (err) {
+    console.error("Błąd dekodowania danych:", err);
+    res.status(500).json({ message: "Błąd dekodowania danych" });
+  }
+});
+
 //--------------------------------------------------------------------------------------------------------------------- Poczatek zmian ACL
+
+//Socket.io
+
+// Tworzymy serwer HTTP narazie jak co
+app.get("/chats", authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+  const connection = await connectDB();
+  const query = `
+    SELECT 
+      p.id AS rideId,
+      p.data_zamowienia,
+      CASE 
+        WHEN p.pasazer_id = ? THEN k.imie 
+        ELSE pas.imie 
+      END AS otherName
+    FROM przejazdy p
+    JOIN uzytkownicy k   ON k.id = p.kierowca_id
+    JOIN uzytkownicy pas ON pas.id = p.pasazer_id
+    WHERE (p.pasazer_id = ? OR p.kierowca_id = ?)
+      AND p.data_zamowienia >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+    ORDER BY p.data_zamowienia DESC
+  `;
+  try {
+    const [rows] = await connection.execute(query, [
+      userId,
+      userId,
+      userId,
+    ]);
+    await connection.end();
+    // dla szyfracji na przyszłość
+    const data = await encryptData(rows);
+    return res.json(data);
+    // jeżeli bedzie brak szyfracji
+    // return res.json(rows);
+  } catch (err) {
+    console.error("Error fetching chats:", err);
+    await connection.end();
+    res.status(500).json({ message: "Błąd serwera" });
+  }
+});
+
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: { origin: "http://localhost:8100", methods: ["GET","POST"] }
+});
+
+io.on("connection", (socket) => {
+  console.log("Socket connected:", socket.id);
+
+  socket.on("joinRoom", async ({ rideId }) => {
+    const room = `ride-${rideId}`;
+    socket.join(room);
+  
+    try {
+      const conn = await connectDB();
+      const [history] = await conn.execute(
+        `SELECT 
+           nadawca_email   AS senderEmail,
+           tresc           AS message,
+           czas            AS timestamp
+         FROM wiadomosci
+         WHERE przejazd_id = ?
+         ORDER BY czas ASC`,
+        [rideId]
+      );
+      await conn.end();
+      socket.emit("chatHistory", history);
+    } catch (err) {
+      console.error("Error fetching chat history:", err);
+    }
+  });
+
+  socket.on("sendMessage", async ({ rideId, senderEmail, message }) => {
+    const ts = new Date()
+      .toISOString()
+      .slice(0, 19)
+      .replace("T", " ");
+    socket.broadcast
+      .to(`ride-${rideId}`)
+      .emit("receiveMessage", { senderEmail, message, timestamp: ts });
+
+    (async () => {
+      try {
+        const conn = await connectDB();
+
+        const [tripRows] = await conn.execute(
+          "SELECT pasazer_id, kierowca_id FROM przejazdy WHERE id = ?",
+          [rideId]
+        );
+        if (!tripRows.length) { await conn.end(); return; }
+        const { pasazer_id, kierowca_id } = tripRows[0];
+
+        const [pasRows] = await conn.execute(
+          "SELECT email FROM uzytkownicy WHERE id = ?",
+          [pasazer_id]
+        );
+        const [kierRows] = await conn.execute(
+          "SELECT email FROM uzytkownicy WHERE id = ?",
+          [kierowca_id]
+        );
+        const pasEmail  = pasRows[0]?.email  ?? null;
+        const kierEmail = kierRows[0]?.email ?? null;
+
+        const receiverEmail = (senderEmail === pasEmail ? kierEmail : pasEmail) ?? null;
+
+        const from    = senderEmail    ?? null;
+        const to      = receiverEmail  ?? null;
+        const content = message        ?? "";
+
+        await conn.execute(
+          `INSERT INTO wiadomosci
+             (nadawca_email, odbiorca_email, przejazd_id, tresc, czas)
+           VALUES (?,             ?,               ?,           ?,    ?)`,
+          [from, to, rideId, content, ts]
+        );
+        await conn.end();
+      } catch (err) {
+        console.error("Błąd zapisu czatu:", err);
+      }
+    })();
+  });
+  socket.on("disconnect", () => {
+  });
+});
+
+server.listen(port, () =>
+  console.log(`Serwer działa na porcie http://localhost:${port}`)
+);
