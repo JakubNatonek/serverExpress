@@ -454,6 +454,22 @@ app.post("/zlecenia", authenticateToken, async (req, res) => {
         .json({ message: "Masz już aktywny przejazd. Nie możesz zamówić nowego." });
     }
 
+    // Sprawdzenie, czy kierowca ma już przejazd o statusie 2
+    const checkDriverQuery = `
+      SELECT COUNT(*) AS activeDriverRides
+      FROM przejazdy
+      WHERE kierowca_id = ? AND status_id = 2
+    `;
+    const [driverResult] = await connection.execute(checkDriverQuery, [kierowca_id]);
+
+    if (driverResult[0].activeDriverRides > 0) {
+      await connection.end();
+      return res
+        .status(400)
+        .json({ message: "Wybrany kierowca ma już aktywny przejazd. Nie można przypisać nowego." });
+    }
+
+
     // Dodanie nowego przejazdu
     const query = `
       INSERT INTO przejazdy (pasazer_id, kierowca_id, dystans_km, trasa_przejazdu, cena, data_zamowienia, status_id)
@@ -481,6 +497,89 @@ app.post("/zlecenia", authenticateToken, async (req, res) => {
     res.status(500).json({ message: "Błąd dekodowania danych" });
   }
 });
+
+app.get("/zlecenia", authenticateToken, async (req, res) => {
+  const userId = req.user.id; // ID użytkownika z tokena
+  const connection = await connectDB();
+
+  const query = `
+    SELECT 
+      p.id AS zlecenie_id,
+      p.pasazer_id,
+      pas.imie AS pasazer_imie, -- Imię pasażera
+      p.kierowca_id,
+      kier.imie AS kierowca_imie, -- Imię kierowcy
+      p.dystans_km,
+      p.trasa_przejazdu,
+      p.cena,
+      p.data_zamowienia,
+      p.data_zakonczenia,
+      s.nazwa AS status
+    FROM przejazdy p
+    JOIN uzytkownicy pas ON p.pasazer_id = pas.id -- Dołączenie danych pasażera
+    JOIN uzytkownicy kier ON p.kierowca_id = kier.id -- Dołączenie danych kierowcy
+    JOIN statusy_przejazdu s ON p.status_id = s.id -- Dołączenie statusu
+    WHERE p.pasazer_id = ? OR p.kierowca_id = ?
+    ORDER BY p.data_zamowienia DESC
+  `;
+
+  try {
+    const [rows] = await connection.execute(query, [userId, userId]);
+    await connection.end();
+    const data = await encryptData(rows);
+    res.status(200).json(data); // Zwraca listę zleceń użytkownika
+  } catch (err) {
+    console.error("Błąd podczas pobierania zleceń:", err);
+    await connection.end();
+    res.status(500).json({ message: "Błąd serwera" });
+  }
+});
+
+app.put("/zlecenia/:id/status", authenticateToken, async (req, res) => {
+  const zlecenieId = req.params.id; // ID zlecenia z parametru URL
+  const { iv, data } = req.body; // Odbieranie zaszyfrowanych danych
+
+  if (!iv || !data) {
+    return res.status(400).json({ message: "Brak danych do zaktualizowania" });
+  }
+
+  try {
+    // Deszyfrowanie danych
+    const decryptedData = decryptData(iv, data);
+    const { status_id } = decryptedData;
+    console.log(decryptedData)
+
+    if (!status_id) {
+      return res.status(400).json({ message: "Brak statusu do zaktualizowania" });
+    }
+
+    const connection = await connectDB();
+    const query = `
+      UPDATE przejazdy
+      SET status_id = ?
+      WHERE id = ?
+    `;
+
+    try {
+      const [result] = await connection.execute(query, [status_id, zlecenieId]);
+      await connection.end();
+
+      if (result.affectedRows === 0) {
+        return res.status(404).json({ message: "Nie znaleziono zlecenia" });
+      }
+
+      res.status(200).json({ message: "Status zlecenia został zaktualizowany" });
+    } catch (err) {
+      console.error("Błąd podczas aktualizowania statusu zlecenia:", err);
+      await connection.end();
+      res.status(500).json({ message: "Błąd serwera" });
+    }
+  } catch (err) {
+    console.error("Błąd dekodowania danych:", err);
+    res.status(500).json({ message: "Błąd dekodowania danych" });
+  }
+});
+
 //--------------------------------------------------------------------------------------------------------------------- Poczatek zmian ACL
 
 //Socket.io
