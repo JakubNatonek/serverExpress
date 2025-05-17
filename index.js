@@ -14,8 +14,8 @@ const jwt = require("jsonwebtoken"); // JSON web token -------------------
 
 const JWT_SECRET = process.env.JWT_SECRET;
 
-function generateToken(email, userType, id) {
-  return jwt.sign({ email, userType, id }, JWT_SECRET, { expiresIn: "1h" });
+function generateToken(email, roleId, id) {
+  return jwt.sign({ email, roleId, id }, JWT_SECRET, { expiresIn: "1h" });
 }
 
 app.use(express.json());
@@ -115,10 +115,8 @@ const does_user_exist = async (email) => {
 
 app.post("/register", async (req, res) => {
   try {
-    // console.log("Incoming request body:", req.body);
     const { iv, data } = req.body;
     const decryptedData = decryptData(iv, data);
-    // console.log("Decrypted user data:", decryptedData);
 
     const email = decryptedData.user;
     const haslo_hash = decryptedData.password;
@@ -133,11 +131,27 @@ app.post("/register", async (req, res) => {
           .json({ message: "Użytkownik o tym adresie e-mail już istnieje." });
       }
 
-      // If user does not exist, add to database
-      const result = await add_user(email, haslo_hash);
+      // Dodaj użytkownika do bazy
+      const connection = await connectDB();
+      const [userResult] = await connection.execute(
+        `INSERT INTO uzytkownicy (imie, email, telefon, haslo_hash, typ_uzytkownika, data_utworzenia) 
+         VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+        ["NULL", email, "NULL", haslo_hash, "pasażer"]
+      );
+
+      const userId = userResult.insertId;
+
+      // Dodaj rolę do rola_as_uzytkownik (domyślnie pasażer = 2)
+      await connection.execute(
+        `INSERT INTO rola_as_uzytkownik (uzytkownik_id, rola_id) VALUES (?, ?)`,
+        [userId, 2]
+      );
+
+      await connection.end();
+
       return res
         .status(201)
-        .json({ message: "Użytkownik dodany pomyślnie!", result });
+        .json({ message: "Użytkownik dodany pomyślnie!", userId });
     } catch (err) {
       console.error("Błąd podczas dodawania użytkownika:", err);
       return res
@@ -168,21 +182,35 @@ app.post("/login", async (req, res) => {
   try {
     const { iv, data } = req.body;
     const decryptedData = decryptData(iv, data);
-    // console.log(decryptedData)
     const email = decryptedData.user;
     const haslo_hash = decryptedData.password;
 
     try {
       const user = await login_user(email, haslo_hash);
-      // console.log(user);
       if (!user) {
         return res
           .status(400)
           .json({ message: "Niepoprawny adres e-mail lub hasło." });
       }
-      // console.log(user.typ_uzytkownika);
-      // Generowanie tokena JWT z rolą użytkownika
-      const token = generateToken(email, user.typ_uzytkownika, user.id);
+
+      // Otwórz nowe połączenie do pobrania roli
+      const connection = await connectDB();
+      const [roleRows] = await connection.execute(
+        "SELECT rola_id FROM rola_as_uzytkownik WHERE uzytkownik_id = ?",
+        [user.id]
+      );
+      await connection.end();
+
+      const roleId = roleRows.length ? roleRows[0].rola_id : null;
+      
+      // Sprawdź czy konto nie jest zamknięte (rola_id = 4)
+      if (roleId === 4) {
+        return res
+          .status(403)
+          .json({ message: "Konto zostało zamknięte. Skontaktuj się z administratorem." });
+      }
+      
+      const token = generateToken(email, roleId, user.id);
 
       return res.status(200).json({ message: "Zalogowano pomyślnie!", token });
     } catch (err) {
@@ -212,61 +240,91 @@ function authenticateToken(req, res, next) {
   });
 }
 
-app.get(
-  "/users",
-  authenticateToken,
-  authorizeRole("admin"),
-  async (req, res) => {
-    try {
-      const connection = await connectDB();
-      const [rows] = await connection.execute("SELECT * FROM uzytkownicy");
-      await connection.end();
-      res.json(rows);
-    } catch (err) {
-      console.error("Error fetching data: ", err);
-      return res
-        .status(500)
-        .json({ message: "Błąd" });
-    }
-  }
-);
+
 
 //--------------------------------------------------------------------------------------------------------------------- Poczatek zmian
 
-function authorizeRole(...allowedRoles) {
+function authorizeRole(...allowedRoleIds) {
   return (req, res, next) => {
-    const userType = req.user.userType;
-    // console.log(req.user)
-    if (!allowedRoles.includes(userType)) {
-      console.error("Brak dostępu dla roli:", userType);
+    const userRoleId = req.user.roleId;
+    if (!allowedRoleIds.includes(userRoleId)) {
       return res.status(403).json({ message: "Brak dostępu" });
     }
     next();
   };
 }
 
-// Dodaj nowego użytkownika
+// Pobierz wszystkie role (do selecta w panelu admina)
+app.get("/roles", authenticateToken, async (req, res) => {
+  try {
+    const connection = await connectDB();
+    const [rows] = await connection.execute("SELECT ID as id, przywilej as nazwa FROM role");
+    await connection.end();
+    
+    // Zaszyfruj dane przed wysłaniem
+    const encryptedData = await encryptData(rows);
+    res.json(encryptedData);
+  } catch (err) {
+    res.status(500).json({ message: "Błąd podczas pobierania ról" });
+  }
+});
+
+// Pobierz użytkowników z nazwą roli (JOIN)
+app.get(
+  "/users",
+  authenticateToken,
+  authorizeRole(1),
+  async (req, res) => {
+    try {
+      const connection = await connectDB();
+      const [rows] = await connection.execute(`
+        SELECT 
+          u.id, u.imie, u.email, u.telefon, u.data_utworzenia,
+          r.ID AS rola_id, r.przywilej AS rola_nazwa
+        FROM uzytkownicy u
+        LEFT JOIN rola_as_uzytkownik rau ON u.id = rau.uzytkownik_id
+        LEFT JOIN role r ON rau.rola_id = r.ID
+      `);
+      await connection.end();
+      
+      // Szyfrowanie danych
+      const encryptedData = await encryptData(rows);
+      res.json(encryptedData);
+    } catch (err) {
+      console.error("Error fetching data: ", err);
+      return res.status(500).json({ message: "Błąd" });
+    }
+  }
+);
+
+// Dodaj nowego użytkownika z rolą
 app.post(
   "/users",
   authenticateToken,
-  authorizeRole("admin"),
+  authorizeRole(1),
   async (req, res) => {
-    const { email, imie, telefon, typ_uzytkownika, haslo } = req.body;
-    if (!email || !haslo)
-      return res.status(400).json({ message: "Email i hasło są wymagane" });
     try {
+      // Odszyfrowanie danych
+      const { iv, data } = req.body;
+      const decryptedData = decryptData(iv, data);
+      
+      const { email, imie, telefon, haslo, rola_id } = decryptedData;
+      if (!email || !haslo)
+        return res.status(400).json({ message: "Email i hasło są wymagane" });
+      
       const connection = await connectDB();
-      const query = `
-      INSERT INTO uzytkownicy (imie, email, telefon, haslo_hash, typ_uzytkownika, data_utworzenia)
-      VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-    `;
-      await connection.execute(query, [
-        imie,
-        email,
-        telefon,
-        haslo,
-        typ_uzytkownika,
-      ]);
+      // Dodaj użytkownika
+      const [userResult] = await connection.execute(
+        `INSERT INTO uzytkownicy (imie, email, telefon, haslo_hash, data_utworzenia)
+         VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+        [imie, email, telefon, haslo]
+      );
+      const userId = userResult.insertId;
+      // Dodaj rolę do rola_as_uzytkownik
+      await connection.execute(
+        `INSERT INTO rola_as_uzytkownik (uzytkownik_id, rola_id) VALUES (?, ?)`,
+        [userId, rola_id || 2]
+      );
       await connection.end();
       res.status(201).json({ message: "Użytkownik dodany" });
     } catch (err) {
@@ -275,24 +333,29 @@ app.post(
   }
 );
 
-// Edytuj użytkownika
+// Edytuj użytkownika (dane)
 app.put(
   "/users/:email",
   authenticateToken,
-  authorizeRole("admin"),
+  authorizeRole(1),
   async (req, res) => {
-    const { email } = req.params;
-    const { imie = "", telefon = "", typ_uzytkownika = "" } = req.body;
     try {
+      const { email } = req.params;
+      
+      // Odszyfrowanie danych
+      const { iv, data } = req.body;
+      const decryptedData = decryptData(iv, data);
+      
+      const { imie = "", telefon = "" } = decryptedData;
+      
       const connection = await connectDB();
       const query = `
-      UPDATE uzytkownicy SET imie=?, telefon=?, typ_uzytkownika=?
-      WHERE email=?
-    `;
+        UPDATE uzytkownicy SET imie=?, telefon=?
+        WHERE email=?
+      `;
       const [result] = await connection.execute(query, [
         imie,
         telefon,
-        typ_uzytkownika,
         email,
       ]);
       await connection.end();
@@ -301,25 +364,87 @@ app.put(
       }
       res.status(200).json({ message: "Użytkownik zaktualizowany" });
     } catch (err) {
-      res
-        .status(500)
-        .json({ message: "Błąd podczas aktualizacji użytkownika" });
+      res.status(500).json({ message: "Błąd podczas aktualizacji użytkownika" });
     }
   }
 );
 
-// Usuń użytkownika
+// Edytuj rolę użytkownika (rola_as_uzytkownik)
+app.put(
+  "/users/:email/role",
+  authenticateToken,
+  authorizeRole(1),
+  async (req, res) => {
+    try {
+      const { email } = req.params;
+      
+      // Odszyfrowanie danych
+      const { iv, data } = req.body;
+      const decryptedData = decryptData(iv, data);
+      
+      const { rola_id } = decryptedData;
+      
+      if (!rola_id) return res.status(400).json({ message: "Brak roli" });
+      
+      const connection = await connectDB();
+      // Pobierz id użytkownika
+      const [userRows] = await connection.execute(
+        "SELECT id FROM uzytkownicy WHERE email=?",
+        [email]
+      );
+      if (!userRows.length) {
+        await connection.end();
+        return res.status(404).json({ message: "Nie znaleziono użytkownika" });
+      }
+      const userId = userRows[0].id;
+      // Zmień rolę
+      await connection.execute(
+        `UPDATE rola_as_uzytkownik SET rola_id=? WHERE uzytkownik_id=?`,
+        [rola_id, userId]
+      );
+      await connection.end();
+      res.status(200).json({ message: "Rola użytkownika zaktualizowana" });
+    } catch (err) {
+      res.status(500).json({ message: "Błąd podczas aktualizacji roli" });
+    }
+  }
+);
+
+// Usuń użytkownika (usuń też rolę)
 app.delete(
   "/users/:email",
   authenticateToken,
-  authorizeRole("admin"),
+  authorizeRole(1),
   async (req, res) => {
-    const { email } = req.params;
     try {
+      const { email } = req.params;
+      
+      // W przypadku DELETE może nie być body, ale gdyby było, można odszyfrować
+      let decryptedData = {};
+      if (req.body && req.body.iv && req.body.data) {
+        decryptedData = decryptData(req.body.iv, req.body.data);
+      }
+      
       const connection = await connectDB();
-      const [result] = await connection.execute(
-        "DELETE FROM uzytkownicy WHERE email=?",
+      // Pobierz id użytkownika
+      const [userRows] = await connection.execute(
+        "SELECT id FROM uzytkownicy WHERE email=?",
         [email]
+      );
+      if (!userRows.length) {
+        await connection.end();
+        return res.status(404).json({ message: "Nie znaleziono użytkownika" });
+      }
+      const userId = userRows[0].id;
+      // Usuń rolę
+      await connection.execute(
+        "DELETE FROM rola_as_uzytkownik WHERE uzytkownik_id=?",
+        [userId]
+      );
+      // Usuń użytkownika
+      const [result] = await connection.execute(
+        "DELETE FROM uzytkownicy WHERE id=?",
+        [userId]
       );
       await connection.end();
       if (result.affectedRows === 0)
@@ -378,28 +503,29 @@ app.get("/bliscy/", authenticateToken, async (req, res) => {
   // console.log(user)
   // console.log(req)
   const uzytkownik_id = user.id;
-  const promien = 5; // domyślnie 5 km
+  const promien = 100; // domyślnie 5 km
   const query = `
-          SELECT 
-              l2.uzytkownik_id,
-              u.imie AS imie_kierowcy,
-              (
-                  6371 * acos(
-                      cos(radians(l1.szerokosc_geo)) * 
-                      cos(radians(l2.szerokosc_geo)) *
-                      cos(radians(l2.dlugosc_geo) - radians(l1.dlugosc_geo)) +
-                      sin(radians(l1.szerokosc_geo)) *
-                      sin(radians(l2.szerokosc_geo))
-                  )
-              ) AS dystans_km
-          FROM lokalizacje l1
-          JOIN lokalizacje l2 ON l1.uzytkownik_id != l2.uzytkownik_id
-          JOIN uzytkownicy u ON l2.uzytkownik_id = u.id
-          WHERE l1.uzytkownik_id = ?
-            AND u.typ_uzytkownika = 'kierowca'
-          HAVING dystans_km < ?
-          ORDER BY dystans_km ASC
-          LIMIT 10;
+    SELECT 
+      l2.uzytkownik_id,
+      u.imie AS imie_kierowcy,
+      (
+        6371 * acos(
+          cos(radians(l1.szerokosc_geo)) * 
+          cos(radians(l2.szerokosc_geo)) *
+          cos(radians(l2.dlugosc_geo) - radians(l1.dlugosc_geo)) +
+          sin(radians(l1.szerokosc_geo)) *
+          sin(radians(l2.szerokosc_geo))
+        )
+      ) AS dystans_km
+    FROM lokalizacje l1
+    JOIN lokalizacje l2 ON l1.uzytkownik_id != l2.uzytkownik_id
+    JOIN uzytkownicy u ON l2.uzytkownik_id = u.id
+    JOIN rola_as_uzytkownik rau ON u.id = rau.uzytkownik_id
+    WHERE l1.uzytkownik_id = ?
+      AND rau.rola_id = 3 -- Tylko użytkownicy z rolą kierowca
+    HAVING dystans_km < ?
+    ORDER BY dystans_km ASC
+    LIMIT 10;
     `;
   const connection = await connectDB();
   try {
@@ -580,6 +706,7 @@ app.put("/zlecenia/:id/status", authenticateToken, async (req, res) => {
   }
 });
 
+
 //--------------------------------------------------------------------------------------------------------------------- Poczatek zmian ACL
 
 //Socket.io
@@ -708,4 +835,374 @@ io.on("connection", (socket) => {
 
 server.listen(port, () =>
   console.log(`Serwer działa na porcie http://localhost:${port}`)
+);
+
+//--------------------------------------------------------------------------------------------------------------------- Poczatek zmian PROFIL
+
+// Pobierz dane profilu zalogowanego użytkownika
+app.get("/profile", authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const connection = await connectDB();
+    const [rows] = await connection.execute(
+      `SELECT imie, email, telefon, data_utworzenia FROM uzytkownicy WHERE id=?`,
+      [userId]
+    );
+    await connection.end();
+    if (!rows.length) return res.status(404).json({ message: "Nie znaleziono użytkownika" });
+    res.json(rows[0]);
+  } catch (err) {
+    res.status(500).json({ message: "Błąd pobierania profilu" });
+  }
+});
+
+// Edytuj dane profilu (imię, telefon)
+app.put("/profile", authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+  const { imie = "", telefon = "" } = req.body;
+  try {
+    const connection = await connectDB();
+    await connection.execute(
+      `UPDATE uzytkownicy SET imie=?, telefon=? WHERE id=?`,
+      [imie, telefon, userId]
+    );
+    await connection.end();
+    res.status(200).json({ message: "Profil zaktualizowany" });
+  } catch (err) {
+    res.status(500).json({ message: "Błąd zapisu profilu" });
+  }
+});
+
+
+
+// Usuń konto użytkownika
+app.delete("/profile", authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+  try {
+    const connection = await connectDB();
+    await connection.execute(
+      "DELETE FROM rola_as_uzytkownik WHERE uzytkownik_id=?",
+      [userId]
+    );
+    await connection.execute(
+      "DELETE FROM uzytkownicy WHERE id=?",
+      [userId]
+    );
+    await connection.end();
+    res.json({ message: "Konto usunięte" });
+  } catch (err) {
+    res.status(500).json({ message: "Błąd usuwania konta" });
+  }
+});
+
+
+app.put("/profile/password", authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+  const { oldPassword, newPassword } = req.body;
+  if (!oldPassword || !newPassword) {
+    return res.status(400).json({ message: "Brak danych" });
+  }
+  try {
+    const connection = await connectDB();
+    // Pobierz aktualny hash hasła
+    const [rows] = await connection.execute(
+      "SELECT haslo_hash FROM uzytkownicy WHERE id=?",
+      [userId]
+    );
+    if (!rows.length) {
+      await connection.end();
+      return res.status(404).json({ message: "Nie znaleziono użytkownika" });
+    }
+    const currentHash = rows[0].haslo_hash;
+    if (currentHash !== oldPassword) {
+      await connection.end();
+      return res.status(400).json({ message: "Stare hasło nieprawidłowe" });
+    }
+    // Zmień hasło na nowe (już zahashowane)
+    await connection.execute(
+      "UPDATE uzytkownicy SET haslo_hash=? WHERE id=?",
+      [newPassword, userId]
+    );
+    await connection.end();
+    res.status(200).json({ message: "Hasło zmienione" });
+  } catch (err) {
+    res.status(500).json({ message: "Błąd zmiany hasła" });
+  }
+});
+
+//--------------------------------------------------------------------------------------------------------------------- Koniec zmian PROFIL
+
+
+//--------------------------------------------------------------------------------------------------------------------- Poczatek zmian ADMIN-Przeajzdy
+
+app.get(
+  "/admin/rides",
+  authenticateToken,
+  authorizeRole(1),
+  async (req, res) => {
+    try {
+      const connection = await connectDB();
+      const query = `
+        SELECT 
+          p.id, 
+          p.pasazer_id,
+          pas.imie AS pasazer_imie,
+          pas.email AS pasazer_email,
+          p.kierowca_id,
+          kier.imie AS kierowca_imie,
+          kier.email AS kierowca_email,
+          p.dystans_km,
+          p.cena,
+          p.data_zamowienia,
+          p.data_rozpoczecia,
+          p.data_zakonczenia,
+          s.nazwa AS status,
+          s.id AS status_id
+        FROM przejazdy p
+        JOIN uzytkownicy pas ON p.pasazer_id = pas.id
+        JOIN uzytkownicy kier ON p.kierowca_id = kier.id
+        JOIN statusy_przejazdu s ON p.status_id = s.id
+        ORDER BY p.data_zamowienia DESC
+      `;
+      const [rows] = await connection.execute(query);
+      await connection.end();
+      const data = await encryptData(rows);
+      res.json(data);
+    } catch (err) {
+      console.error("Error fetching rides:", err);
+      res.status(500).json({ message: "Błąd serwera" });
+    }
+  }
+);
+
+
+app.get(
+  "/admin/rides/:id",
+  authenticateToken,
+  authorizeRole(1),
+  async (req, res) => {
+    try {
+      const rideId = req.params.id;
+      const connection = await connectDB();
+      const query = `
+        SELECT 
+          p.*,
+          pas.imie AS pasazer_imie,
+          pas.email AS pasazer_email,
+          kier.imie AS kierowca_imie,
+          kier.email AS kierowca_email,
+          s.nazwa AS status_nazwa
+        FROM przejazdy p
+        JOIN uzytkownicy pas ON p.pasazer_id = pas.id
+        JOIN uzytkownicy kier ON p.kierowca_id = kier.id
+        JOIN statusy_przejazdu s ON p.status_id = s.id
+        WHERE p.id = ?
+      `;
+      const [rows] = await connection.execute(query, [rideId]);
+      await connection.end();
+      
+      if (!rows.length) {
+        return res.status(404).json({ message: "Przejazd nie istnieje" });
+      }
+      
+      // Upewniamy się, że trasa_przejazdu jest w odpowiednim formacie
+      const rideData = rows[0];
+      
+      // Jeśli trasa_przejazdu jest ciągiem JSON, zamień go na ciąg tekstowy
+      if (typeof rideData.trasa_przejazdu === 'string') {
+        try {
+          // Sprawdź, czy to możliwy JSON string
+          if (rideData.trasa_przejazdu.startsWith('{') || rideData.trasa_przejazdu.startsWith('[')) {
+            // Jeśli to JSON, parsuj go, aby uzyskać wartość polyline
+            const parsedRoute = JSON.parse(rideData.trasa_przejazdu);
+            // Zakładamy, że polyline jest przechowywane jako string wewnątrz JSON
+            if (parsedRoute.polyline) {
+              rideData.trasa_przejazdu = parsedRoute.polyline;
+            }
+          }
+          // W przeciwnym razie pozostaw jak jest - może to już być ciąg polyline
+        } catch (e) {
+          // Jeśli parsowanie nie powiodło się, pozostawiamy oryginalną wartość
+        }
+      }
+      
+      const data = await encryptData(rideData);
+      res.json(data);
+    } catch (err) {
+      res.status(500).json({ message: "Błąd serwera" });
+    }
+  }
+);
+
+
+app.put(
+  "/admin/rides/:id",
+  authenticateToken,
+  authorizeRole(1),
+  async (req, res) => {
+    try {
+      const rideId = req.params.id;
+      
+      // Sprawdzamy czy dane są w oczekiwanym formacie
+      if (!req.body || !req.body.iv || !req.body.data) {
+        return res.status(400).json({ message: "Nieprawidłowy format danych" });
+      }
+      
+      const { iv, data } = req.body;
+      
+      try {
+        const decryptedData = decryptData(iv, data);
+        
+        // Weryfikacja czy mamy wszystkie wymagane pola
+        const {
+          pasazer_id,
+          kierowca_id,
+          cena,
+          dystans_km,
+          status_id,
+          data_rozpoczecia,
+          data_zakonczenia
+        } = decryptedData;
+        
+        if (!cena || !dystans_km || !status_id) {
+          return res.status(400).json({ message: "Brakuje wymaganych pól" });
+        }
+        
+        const connection = await connectDB();
+        
+        // Znajdź istniejący przejazd, aby zachować pola, których nie edytujemy
+        const [existingRide] = await connection.execute(
+          "SELECT * FROM przejazdy WHERE id = ?",
+          [rideId]
+        );
+        
+        if (!existingRide.length) {
+          await connection.end();
+          return res.status(404).json({ message: "Przejazd nie istnieje" });
+        }
+        
+        // Aktualizuj tylko pola, które mogą być edytowane z frontu
+        const query = `
+          UPDATE przejazdy
+          SET 
+            cena = ?,
+            dystans_km = ?,
+            status_id = ?
+          WHERE id = ?
+        `;
+        
+        const [result] = await connection.execute(query, [
+          cena,
+          dystans_km,
+          status_id,
+          rideId
+        ]);
+        
+        await connection.end();
+        
+        if (result.affectedRows === 0) {
+          return res.status(404).json({ message: "Przejazd nie został zaktualizowany" });
+        }
+        
+        res.json({ message: "Przejazd zaktualizowany" });
+      } catch (decryptError) {
+        return res.status(400).json({ message: "Błąd dekryptowania danych" });
+      }
+    } catch (err) {
+      res.status(500).json({ message: "Błąd serwera" });
+    }
+  }
+);
+
+// Delete ride (admin only) - actually, just change status to 5
+app.delete(
+  "/admin/rides/:id",
+  authenticateToken,
+  authorizeRole(1),
+  async (req, res) => {
+    try {
+      const rideId = req.params.id;
+      const connection = await connectDB();
+      
+      // Zamiast usuwać, zmieniamy status na 5 (anulowany/zamknięty)
+      const [result] = await connection.execute(
+        "UPDATE przejazdy SET status_id = 5, data_zakonczenia = NOW() WHERE id = ?",
+        [rideId]
+      );
+      
+      await connection.end();
+      
+      if (result.affectedRows === 0) {
+        return res.status(404).json({ message: "Przejazd nie istnieje" });
+      }
+      
+      res.json({ message: "Przejazd anulowany" });
+    } catch (err) {
+      res.status(500).json({ message: "Błąd serwera" });
+    }
+  }
+);
+
+// Pobierz podsumowanie statystyk przejazdów
+app.get(
+  "/admin/rides/stats/summary",
+  authenticateToken,
+  authorizeRole(1),
+  async (req, res) => {
+    try {
+      const connection = await connectDB();
+      const query = `
+        SELECT
+          COUNT(CASE WHEN status_id = 3 THEN 1 END) AS total_rides,
+          COALESCE(SUM(CASE WHEN status_id = 3 THEN cena ELSE 0 END), 0) AS total_revenue,
+          COALESCE(AVG(CASE WHEN status_id = 3 THEN cena END), 0) AS avg_price,
+          COALESCE(AVG(CASE WHEN status_id = 3 THEN dystans_km END), 0) AS avg_distance,
+          COUNT(CASE WHEN status_id = 1 THEN 1 END) AS pending_rides,
+          COUNT(CASE WHEN status_id = 2 THEN 1 END) AS active_rides,
+          COUNT(CASE WHEN status_id = 3 THEN 1 END) AS completed_rides,
+          COUNT(CASE WHEN status_id = 4 THEN 1 END) AS cancelled_rides,
+          COUNT(CASE WHEN status_id = 5 THEN 1 END) AS closed_rides
+        FROM przejazdy
+      `;
+      
+      const [rows] = await connection.execute(query);
+      await connection.end();
+      
+      // Konwersja wartości na liczby przed wysłaniem do klienta
+      const stats = rows[0];
+      const formattedStats = {
+        total_rides: Number(stats.total_rides),
+        total_revenue: Number(stats.total_revenue).toFixed(2),
+        avg_price: Number(stats.avg_price).toFixed(2),
+        avg_distance: Number(stats.avg_distance).toFixed(2),
+        pending_rides: Number(stats.pending_rides),
+        active_rides: Number(stats.active_rides),
+        completed_rides: Number(stats.completed_rides),
+        cancelled_rides: Number(stats.cancelled_rides),
+        closed_rides: Number(stats.closed_rides)
+      };
+      
+      const data = await encryptData(formattedStats);
+      res.json(data);
+    } catch (err) {
+      res.status(500).json({ message: "Błąd serwera" });
+    }
+  }
+);
+
+// Pobierz wszystkie dostępne statusy przejazdów
+app.get(
+  "/admin/ride-statuses",
+  authenticateToken,
+  authorizeRole(1),
+  async (req, res) => {
+    try {
+      const connection = await connectDB();
+      const [rows] = await connection.execute("SELECT * FROM statusy_przejazdu");
+      await connection.end();
+      res.json(rows);
+    } catch (err) {
+      res.status(500).json({ message: "Błąd serwera" });
+    }
+  }
 );
