@@ -673,19 +673,40 @@ app.put("/zlecenia/:id/status", authenticateToken, async (req, res) => {
     // Deszyfrowanie danych
     const decryptedData = decryptData(iv, data);
     const { status_id } = decryptedData;
-    console.log(decryptedData)
+    //console.log(decryptedData)
 
     if (!status_id) {
       return res.status(400).json({ message: "Brak statusu do zaktualizowania" });
     }
 
     const connection = await connectDB();
-    const query = `
-      UPDATE przejazdy
-      SET status_id = ?
-      WHERE id = ?
-    `;
-
+    let query;
+    let params;
+    
+    if (status_id === 3 || status_id === 4) {
+      query = `
+        UPDATE przejazdy
+        SET status_id = ?, data_zakonczenia = NOW()
+        WHERE id = ?
+      `;
+      params = [status_id, zlecenieId];
+    } else if (status_id === 2) {
+      // Dla statusu "w trakcie" ustawiamy datę rozpoczęcia
+      query = `
+        UPDATE przejazdy
+        SET status_id = ?, data_rozpoczecia = NOW()
+        WHERE id = ?
+      `;
+      params = [status_id, zlecenieId];
+    } else {
+      // Dla pozostałych statusów - tylko zmiana statusu
+      query = `
+        UPDATE przejazdy
+        SET status_id = ?
+        WHERE id = ?
+      `;
+      params = [status_id, zlecenieId];
+    }
     try {
       const [result] = await connection.execute(query, [status_id, zlecenieId]);
       await connection.end();
@@ -874,8 +895,6 @@ app.put("/profile", authenticateToken, async (req, res) => {
 });
 
 
-
-// Usuń konto użytkownika
 app.delete("/profile", authenticateToken, async (req, res) => {
   const userId = req.user.id;
   try {
@@ -1206,3 +1225,65 @@ app.get(
     }
   }
 );
+//--------------------------------------------------------------------------------------------------------------------- Koniec zmian ADMIN-Przeajdy
+
+//--------------------------------------------------------------------------------------------------------------------- Poczatek zmian Zakończenie przejazdu
+
+// Endpoint do dodawania oceny kierowcy i aktualizacji jego średniej oceny
+app.post("/oceny", authenticateToken, async (req, res) => {
+  const { iv, data } = req.body;
+  if (!iv || !data) {
+    return res.status(400).json({ message: "Brak danych" });
+  }
+
+  try {
+    const decryptedData = decryptData(iv, data);
+    const { kierowca_id, przejazd_id, ocena, komentarz } = decryptedData;
+    const pasazer_id = req.user.id; // ID pasażera z tokena JWT
+
+    if (!kierowca_id || !przejazd_id || !ocena) {
+      return res.status(400).json({ message: "Brak wymaganych danych" });
+    }
+
+    const connection = await connectDB();
+    
+    try {
+      // Rozpoczęcie transakcji
+      await connection.beginTransaction();
+      
+      // 1. Dodaj ocenę kierowcy
+      const query = `
+        INSERT INTO oceny_kierowcow 
+        (kierowca_id, pasazer_id, przejazd_id, ocena, komentarz, data_oceny)
+        VALUES (?, ?, ?, ?, ?, NOW())
+      `;
+
+      await connection.execute(query, [
+        kierowca_id,
+        pasazer_id,
+        przejazd_id,
+        ocena,
+        komentarz || null
+      ]);
+      
+      // 2. Aktualizuj średnią ocenę kierowcy
+      await connection.execute("CALL UpdateDriverRating(?)", [kierowca_id]);
+      
+      // Zatwierdź transakcję
+      await connection.commit();
+      
+      res.status(201).json({ message: "Ocena została zapisana i średnia ocena kierowcy zaktualizowana" });
+    } catch (err) {
+      // W przypadku błędu wycofaj transakcję
+      await connection.rollback();
+      throw err;
+    } finally {
+      await connection.end();
+    }
+  } catch (err) {
+    console.error("Błąd zapisywania oceny:", err);
+    res.status(500).json({ message: "Błąd serwera" });
+  }
+});
+
+//--------------------------------------------------------------------------------------------------------------------- Koniec zmian Zakończenie przejazdu
