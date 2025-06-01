@@ -469,68 +469,85 @@ app.delete(
 
 //--------------------------------------------------------------------------------------------------------------------- Koniec zmian
 
-const Lokalizacja = require('./models/Lokalizacja');
-
 // Zapis lokalizacji użytkownika
 app.post("/lokalizacja", authenticateToken, async (req, res) => {
-  try {
-    const user = req.user;
-    const { iv, data } = req.body;
-    const decryptedData = decryptData(iv, data);
-    
-    const uzytkownik_id = user.id;
-    const szerokosc_geo = decryptedData.szerokosc_geo;
-    const dlugosc_geo = decryptedData.dlugosc_geo;
-    
-    if (!szerokosc_geo || !dlugosc_geo) {
-      return res.status(400).json({ message: "Brak wymaganych danych" });
-    }
+  const user = req.user;
+  // console.log(user);
+  const { iv, data } = req.body;
+  const decryptedData = decryptData(iv, data);
+  // console.log(decryptedData)
+  const uzytkownik_id = user.id;
+  const szerokosc_geo = decryptedData.szerokosc_geo;
+  const dlugosc_geo = decryptedData.dlugosc_geo;
+  if (!szerokosc_geo || !dlugosc_geo) {
+    return res.status(400).json({ message: "Brak wymaganych danych" });
+  }
 
-    // Use Sequelize upsert (equivalent to INSERT ... ON DUPLICATE KEY UPDATE)
-    await Lokalizacja.upsert({
-      uzytkownik_id: uzytkownik_id,
-      szerokosc_geo: szerokosc_geo,
-      dlugosc_geo: dlugosc_geo,
-      zaktualizowano: sequelize.literal('NOW()')
-    });
-    
+  const query = `
+      INSERT INTO lokalizacje (uzytkownik_id, szerokosc_geo, dlugosc_geo, zaktualizowano)
+      VALUES (?, ?, ?, NOW())
+      ON DUPLICATE KEY UPDATE
+        szerokosc_geo = VALUES(szerokosc_geo),
+        dlugosc_geo = VALUES(dlugosc_geo),
+        zaktualizowano = NOW()
+    `;
+  const connection = await connectDB();
+  try {
+    await connection.execute(query, [
+      uzytkownik_id,
+      szerokosc_geo,
+      dlugosc_geo,
+    ]);
+    await connection.end();
     res.json({ message: "Lokalizacja zapisana" });
   } catch (err) {
     console.error(err);
+    await connection.end();
     res.status(500).json({ message: "Błąd serwera" });
   }
 });
 
-
-
-// Replace the existing endpoint
 app.get("/bliscy/", authenticateToken, async (req, res) => {
+  const user = req.user;
+  // const { iv, data } = req.body;
+  // const decryptedData = decryptData(iv, data);
+  // console.log(user)
+  // console.log(req)
+  const uzytkownik_id = user.id;
+  const promien = 100; // domyślnie 5 km
+  const query = `
+    SELECT 
+      l2.uzytkownik_id,
+      u.imie AS imie_kierowcy,
+      (
+        6371 * acos(
+          cos(radians(l1.szerokosc_geo)) * 
+          cos(radians(l2.szerokosc_geo)) *
+          cos(radians(l2.dlugosc_geo) - radians(l1.dlugosc_geo)) +
+          sin(radians(l1.szerokosc_geo)) *
+          sin(radians(l2.szerokosc_geo))
+        )
+      ) AS dystans_km
+    FROM lokalizacje l1
+    JOIN lokalizacje l2 ON l1.uzytkownik_id != l2.uzytkownik_id
+    JOIN uzytkownicy u ON l2.uzytkownik_id = u.id
+    JOIN rola_as_uzytkownik rau ON u.id = rau.uzytkownik_id
+    WHERE l1.uzytkownik_id = ?
+      AND rau.rola_id = 3 -- Tylko użytkownicy z rolą kierowca
+    HAVING dystans_km < ?
+    ORDER BY dystans_km ASC
+    LIMIT 10;
+    `;
+  const connection = await connectDB();
   try {
-    const userId = req.user.id;
-    const promien = 100; // domyślnie 100 km
-
-    // Call the stored procedure using Sequelize
-    const [results] = await sequelize.query('CALL FindNearbyDrivers(:userId, :promien)', {
-      replacements: { userId, promien },
-      type: sequelize.QueryTypes.RAW
-    });
-
-    // The stored procedure results are usually in the first element of the results array
-    // The format can be [resultSet, metadata] or [[resultSet], metadata]
-    let nearbyDrivers;
-    
-    // Handle different possible result formats
-    if (Array.isArray(results[0])) {
-      nearbyDrivers = results[0];  // [[resultSet], metadata] format
-    } else {
-      nearbyDrivers = results;     // [resultSet, metadata] format
-    }
-
-    // Encrypt data before sending
-    const data = await encryptData(nearbyDrivers);
-    res.json(data);
+    const [rows] = await connection.execute(query, [uzytkownik_id, promien]);
+    // console.log(rows);
+    await connection.end();
+    const data = await encryptData(rows);
+    res.json(data); // Zwraca listę: { uzytkownik_id, dystans_km }
   } catch (err) {
-    console.error('Error finding nearby drivers:', err);
+    console.error(err);
+    await connection.end();
     res.status(500).json({ message: "Błąd serwera" });
   }
 });
@@ -1429,57 +1446,40 @@ app.post("/oceny", authenticateToken, async (req, res) => {
 
 //--------------------------------------------------------------------------------------------------------------------- Koniec zmian Zakończenie przejazdu
 
-// Import the Payment model at the top of your file with other imports
-const Payment = require('./models/Payment');
-
 // GET payments - can filter by ride ID or user ID
 app.get("/platnosci", authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
     const { przejazd_id } = req.query;
-    
-    // Build query options
-    const queryOptions = {
-      include: [{
-        model: User,
-        as: 'uzytkownik',
-        attributes: ['imie']
-      }],
-      order: [['data', 'DESC']]
-    };
-    
-    // Add where clause based on user role and parameters
-    const whereClause = {};
-    
-    // Filter by ride ID if provided
-    if (przejazd_id) {
-      whereClause.przejazd_id = przejazd_id;
-    }
-    
+
+    const connection = await connectDB();
+    let query = `
+      SELECT 
+        p.id, 
+        p.przejazd_id, 
+        p.kwota, 
+        p.data, 
+        p.id_uzytkownika,
+        u.imie AS nazwa_uzytkownika
+      FROM platnosci p
+      JOIN uzytkownicy u ON p.id_uzytkownika = u.id
+    `;
+
+    const params = [];
+
     // Only admins can see all payments, users see only their own
     if (req.user.roleId !== 1) {
-      whereClause.id_uzytkownika = userId;
+      query += ` AND p.id_uzytkownika = ?`;
+      params.push(userId);
     }
-    
-    if (Object.keys(whereClause).length > 0) {
-      queryOptions.where = whereClause;
-    }
-    
-    // Execute query
-    const payments = await Payment.findAll(queryOptions);
-    
-    // Format the result to match the original structure
-    const formattedPayments = payments.map(payment => ({
-      id: payment.id,
-      przejazd_id: payment.przejazd_id,
-      kwota: payment.kwota,
-      data: payment.data,
-      id_uzytkownika: payment.id_uzytkownika,
-      nazwa_uzytkownika: payment.uzytkownik ? payment.uzytkownik.imie : null
-    }));
-    
+
+    query += ` ORDER BY p.data DESC`;
+
+    const [rows] = await connection.execute(query, params);
+    await connection.end();
+
     // Encrypt data before sending
-    const encryptedData = await encryptData(formattedPayments);
+    const encryptedData = await encryptData(rows);
     res.json(encryptedData);
   } catch (err) {
     console.error("Error fetching payments:", err);
@@ -1500,25 +1500,28 @@ app.post("/platnosci", authenticateToken, async (req, res) => {
     const decryptedData = decryptData(iv, data);
     const { przejazd_id, kwota } = decryptedData;
     const id_uzytkownika = req.user.id;
-    
+    console.log(przejazd_id, kwota);
     if (!przejazd_id || !kwota) {
       return res.status(400).json({ message: "Brak wymaganych danych" });
     }
 
+    const connection = await connectDB();
+
     try {
-      // Create payment using Sequelize
-      const payment = await Payment.create({
-        przejazd_id,
-        kwota,
-        id_uzytkownika,
-        data: sequelize.literal('NOW()')
-      });
+      // Add payment
+      const [result] = await connection.execute(
+        "INSERT INTO platnosci (przejazd_id, kwota, data, id_uzytkownika) VALUES (?, ?, NOW(), ?)",
+        [przejazd_id, kwota, id_uzytkownika]
+      );
+
+      await connection.end();
 
       res.status(201).json({
         message: "Płatność zapisana",
-        id: payment.id
+        id: result.insertId,
       });
     } catch (err) {
+      await connection.end();
       throw err;
     }
   } catch (err) {
@@ -1526,3 +1529,58 @@ app.post("/platnosci", authenticateToken, async (req, res) => {
     res.status(500).json({ message: "Błąd serwera" });
   }
 });
+
+//--------------------------------------------------------------------------------------------------------------------- Początek zmian Ranking
+
+// Endpoint dla rankingu kierowców
+app.get("/api/ranking-kierowcow", async (req, res) => {
+  try {
+    const connection = await connectDB();
+    const query = `
+      SELECT 
+        u.id,
+        u.imie AS name,
+        k.ocena AS averageRating,
+        (SELECT COUNT(*) FROM oceny_kierowcow WHERE kierowca_id = u.id) AS totalReviews
+      FROM uzytkownicy u
+      JOIN kierowcy k ON u.id = k.uzytkownik_id
+      JOIN rola_as_uzytkownik rau ON u.id = rau.uzytkownik_id
+      WHERE rau.rola_id = 3 -- Rola kierowcy
+      ORDER BY k.ocena DESC
+    `;
+    const [rows] = await connection.execute(query);
+    await connection.end();
+    res.json(rows);
+  } catch (err) {
+    console.error("Błąd podczas pobierania rankingu kierowców:", err);
+    res.status(500).json({ message: "Błąd serwera" });
+  }
+});
+
+// Endpoint dla pobierania recenzji kierowcy
+app.get("/api/reviews/:id", async (req, res) => {
+  const driverId = req.params.id;
+  try {
+    const connection = await connectDB();
+    const query = `
+      SELECT 
+        u.imie AS user,
+        o.komentarz AS text,
+        o.data_oceny AS date,
+        o.ocena AS rating
+      FROM oceny_kierowcow o
+      JOIN uzytkownicy u ON o.pasazer_id = u.id
+      WHERE o.kierowca_id = ?
+      ORDER BY o.data_oceny DESC
+    `;
+    const [rows] = await connection.execute(query, [driverId]);
+    await connection.end();
+    res.json(rows);
+  } catch (err) {
+    console.error("Błąd podczas pobierania recenzji kierowcy:", err);
+    res.status(500).json({ message: "Błąd serwera" });
+  }
+});
+//--------------------------------------------------------------------------------------------------------------------- Koniec zmian Ranking
+
+
