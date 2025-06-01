@@ -770,6 +770,43 @@ app.get("/chats", authenticateToken, async (req, res) => {
   }
 });
 
+// Delete chat and update ride status to 5 (closed)
+app.delete("/chats/:id", authenticateToken, async (req, res) => {
+  try {
+    const chatId = req.params.id; // This is actually the ride ID
+    const { reason } = req.body;
+    
+    // Verify the user has permission to delete this chat
+    // (either the passenger or driver of this ride)
+    const connection = await connectDB();
+    const [rideCheck] = await connection.execute(
+      "SELECT pasazer_id, kierowca_id FROM przejazdy WHERE id = ?",
+      [chatId]
+    );
+    
+    if (!rideCheck.length) {
+      await connection.end();
+      return res.status(404).json({ message: "Nie znaleziono przejazdu" });
+    }
+  
+    const [result] = await connection.execute(
+      "UPDATE przejazdy SET status_id = 5 WHERE id = ?",
+      [chatId]
+    );
+    
+    await connection.end();
+    
+    if (result.affectedRows === 0) {
+      return res.status(500).json({ message: "Nie udało się zaktualizować statusu przejazdu" });
+    }
+    
+    res.status(200).json({ message: "Czat i przejazd zostały zamknięte" });
+  } catch (err) {
+    console.error("Error deleting chat:", err);
+    res.status(500).json({ message: "Błąd serwera" });
+  }
+});
+
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: "http://localhost:8100", methods: ["GET","POST"] }
@@ -1287,3 +1324,88 @@ app.post("/oceny", authenticateToken, async (req, res) => {
 });
 
 //--------------------------------------------------------------------------------------------------------------------- Koniec zmian Zakończenie przejazdu
+
+
+// GET payments - can filter by ride ID or user ID
+app.get("/platnosci", authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { przejazd_id } = req.query;
+    
+    const connection = await connectDB();
+    let query = `
+      SELECT 
+        p.id, 
+        p.przejazd_id, 
+        p.kwota, 
+        p.data, 
+        p.id_uzytkownika,
+        u.imie AS nazwa_uzytkownika
+      FROM platnosci p
+      JOIN uzytkownicy u ON p.id_uzytkownika = u.id
+    `;
+    
+    const params = [];
+    
+    // Only admins can see all payments, users see only their own
+    if (req.user.roleId !== 1) {
+      query += ` AND p.id_uzytkownika = ?`;
+      params.push(userId);
+    }
+    
+    query += ` ORDER BY p.data DESC`;
+    
+    const [rows] = await connection.execute(query, params);
+    await connection.end();
+    
+    // Encrypt data before sending
+    const encryptedData = await encryptData(rows);
+    res.json(encryptedData);
+  } catch (err) {
+    console.error("Error fetching payments:", err);
+    res.status(500).json({ message: "Błąd serwera" });
+  }
+});
+
+// POST new payment
+app.post("/platnosci", authenticateToken, async (req, res) => {
+  try {
+    const { iv, data } = req.body;
+    
+    if (!iv || !data) {
+      return res.status(400).json({ message: "Brak danych" });
+    }
+    
+    // Decrypt request data
+    const decryptedData = decryptData(iv, data);
+    const { przejazd_id, kwota } = decryptedData;
+    const id_uzytkownika = req.user.id;
+    console.log(przejazd_id, kwota)
+    if (!przejazd_id || !kwota) {
+      return res.status(400).json({ message: "Brak wymaganych danych" });
+    }
+    
+    const connection = await connectDB();
+    
+    try {
+      // Add payment
+      const [result] = await connection.execute(
+        "INSERT INTO platnosci (przejazd_id, kwota, data, id_uzytkownika) VALUES (?, ?, NOW(), ?)",
+        [przejazd_id, kwota, id_uzytkownika]
+      );
+      
+      await connection.end();
+      
+      res.status(201).json({ 
+        message: "Płatność zapisana", 
+        id: result.insertId 
+      });
+    } catch (err) {
+      await connection.end();
+      throw err;
+    }
+  } catch (err) {
+    console.error("Error processing payment:", err);
+    res.status(500).json({ message: "Błąd serwera" });
+  }
+});
