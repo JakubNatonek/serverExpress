@@ -733,39 +733,110 @@ app.put("/zlecenia/:id/status", authenticateToken, async (req, res) => {
 //Socket.io
 
 // Tworzymy serwer HTTP narazie jak co
+// Tworzymy serwer HTTP narazie jak co
 app.get("/chats", authenticateToken, async (req, res) => {
-  const userId = req.user.id;
-  const connection = await connectDB();
-  const query = `
-    SELECT 
-      p.id AS rideId,
-      p.data_zamowienia,
-      CASE 
-        WHEN p.pasazer_id = ? THEN k.imie 
-        ELSE pas.imie 
-      END AS otherName
-    FROM przejazdy p
-    JOIN uzytkownicy k   ON k.id = p.kierowca_id
-    JOIN uzytkownicy pas ON pas.id = p.pasazer_id
-    WHERE (p.pasazer_id = ? OR p.kierowca_id = ?)
-      AND p.data_zamowienia >= DATE_SUB(NOW(), INTERVAL 7 DAY)
-    ORDER BY p.data_zamowienia DESC
-  `;
+  const { id: userId, userType } = req.user;
+  const conn = await connectDB();
+
+  let query;
+  let params = [];
+
+  if (userType === "admin") {
+    // dla admina – wszystkie przejazdy z ostatnich 7 dni
+    query = `
+      SELECT 
+        p.id                 AS rideId,
+        p.data_zamowienia    AS data_zamowienia,
+        CONCAT(uPas.imie, ' ↔ ', uKer.imie) AS otherName
+      FROM przejazdy p
+      JOIN uzytkownicy uKer ON uKer.id = p.kierowca_id
+      JOIN uzytkownicy uPas ON uPas.id = p.pasazer_id
+      WHERE p.data_zamowienia >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+      ORDER BY p.data_zamowienia DESC
+    `;
+  } else {
+    // dla pasażera/kierowcy – tylko ich własne pokoje
+    query = `
+      SELECT 
+        p.id              AS rideId,
+        p.data_zamowienia AS data_zamowienia,
+        CASE 
+          WHEN p.pasazer_id = ? THEN k.imie 
+          ELSE pas.imie 
+        END AS otherName
+      FROM przejazdy p
+      JOIN uzytkownicy k   ON k.id   = p.kierowca_id
+      JOIN uzytkownicy pas ON pas.id = p.pasazer_id
+      WHERE (p.pasazer_id = ? OR p.kierowca_id = ?)
+        AND p.data_zamowienia >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+      ORDER BY p.data_zamowienia DESC
+    `;
+    params = [userId, userId, userId];
+  }
+
   try {
-    const [rows] = await connection.execute(query, [
-      userId,
-      userId,
-      userId,
-    ]);
-    await connection.end();
-    // dla szyfracji na przyszłość
+    const [rows] = params.length
+      ? await conn.execute(query, params)
+      : await conn.execute(query);
+    await conn.end();
+    // jeśli masz szyfrowanie – od tej linii szyfrujesz rows,
+    // w przeciwnym wypadku po prostu res.json(rows)
     const data = await encryptData(rows);
-    return res.json(data);
-    // jeżeli bedzie brak szyfracji
-    // return res.json(rows);
+    res.json(data);
   } catch (err) {
-    console.error("Error fetching chats:", err);
+    await conn.end();
+    console.error("Błąd pobierania czatów:", err);
+    res.status(500).json({ message: "Błąd serwera" });
+  }
+});
+
+
+// Get chat history for a specific ride
+app.get("/chats/:rideId/history", authenticateToken, async (req, res) => {
+  try {
+    const { rideId } = req.params;
+    const userId = req.user.id;
+    
+    // Verify user has access to this ride's chat
+    const connection = await connectDB();
+    const [rideCheck] = await connection.execute(
+      "SELECT pasazer_id, kierowca_id FROM przejazdy WHERE id = ?",
+      [rideId]
+    );
+    
+    if (!rideCheck.length) {
+      await connection.end();
+      return res.status(404).json({ message: "Nie znaleziono przejazdu" });
+    }
+    
+    const { pasazer_id, kierowca_id } = rideCheck[0];
+    
+    // Only allow passengers, drivers, or admins to access chat history
+    if (userId !== pasazer_id && userId !== kierowca_id && req.user.roleId !== 1) {
+      await connection.end();
+      return res.status(403).json({ message: "Brak uprawnień" });
+    }
+    
+    // Fetch chat history
+    const [history] = await connection.execute(
+      `SELECT 
+         nadawca_email   AS senderEmail,
+         tresc           AS message,
+         czas            AS timestamp
+       FROM wiadomosci
+       WHERE przejazd_id = ?
+       ORDER BY czas ASC`,
+      [rideId]
+    );
+    
     await connection.end();
+    
+    // Encrypt data before sending
+    const encryptedData = await encryptData(history);
+    res.json(encryptedData);
+    
+  } catch (err) {
+    console.error("Error fetching chat history:", err);
     res.status(500).json({ message: "Błąd serwera" });
   }
 });
@@ -839,57 +910,83 @@ io.on("connection", (socket) => {
   });
 
   socket.on("sendMessage", async ({ rideId, senderEmail, message }) => {
-    const ts = new Date()
-      .toISOString()
-      .slice(0, 19)
-      .replace("T", " ");
-    socket.broadcast
-      .to(`ride-${rideId}`)
-      .emit("receiveMessage", { senderEmail, message, timestamp: ts });
+  // 1) Przytnij timestamp do formatu MySQL DATETIME
+  const ts = new Date()
+    .toISOString()
+    .slice(0, 19)
+    .replace("T", " ");
 
-    (async () => {
-      try {
-        const conn = await connectDB();
+  // 2) Pobierz imię nadawcy
+  let senderName = "Nieznany";
+  try {
+    const connName = await connectDB();
+    const [nameRows] = await connName.execute(
+      "SELECT imie FROM uzytkownicy WHERE email = ?",
+      [senderEmail]
+    );
+    await connName.end();
+    if (nameRows.length) senderName = nameRows[0].imie;
+  } catch (e) {
+    console.error("Błąd pobierania imienia:", e);
+  }
 
-        const [tripRows] = await conn.execute(
-          "SELECT pasazer_id, kierowca_id FROM przejazdy WHERE id = ?",
-          [rideId]
-        );
-        if (!tripRows.length) { await conn.end(); return; }
-        const { pasazer_id, kierowca_id } = tripRows[0];
+  // 3) Emituj do pozostałych w pokoju, podając też rideId i senderName
+  socket.broadcast
+    .to(`ride-${rideId}`)
+    .emit("receiveMessage", {
+      rideId,
+      senderEmail,
+      senderName,
+      message,
+      timestamp: ts
+    });
 
-        const [pasRows] = await conn.execute(
-          "SELECT email FROM uzytkownicy WHERE id = ?",
-          [pasazer_id]
-        );
-        const [kierRows] = await conn.execute(
-          "SELECT email FROM uzytkownicy WHERE id = ?",
-          [kierowca_id]
-        );
-        const pasEmail  = pasRows[0]?.email  ?? null;
-        const kierEmail = kierRows[0]?.email ?? null;
+  // 4) Zapisz w bazie w tle
+  (async () => {
+    try {
+      const conn = await connectDB();
 
-        const receiverEmail = (senderEmail === pasEmail ? kierEmail : pasEmail) ?? null;
+      // Pobierz pasazer_id i kierowca_id
+      const [tripRows] = await conn.execute(
+        "SELECT pasazer_id, kierowca_id FROM przejazdy WHERE id = ?",
+        [rideId]
+      );
+      if (!tripRows.length) { await conn.end(); return; }
+      const { pasazer_id, kierowca_id } = tripRows[0];
 
-        const from    = senderEmail    ?? null;
-        const to      = receiverEmail  ?? null;
-        const content = message        ?? "";
+      // Pobierz emaile obu stron
+      const [pasRows] = await conn.execute(
+        "SELECT email FROM uzytkownicy WHERE id = ?",
+        [pasazer_id]
+      );
+      const [kierRows] = await conn.execute(
+        "SELECT email FROM uzytkownicy WHERE id = ?",
+        [kierowca_id]
+      );
+      const pasEmail  = pasRows[0]?.email  ?? null;
+      const kierEmail = kierRows[0]?.email ?? null;
 
-        await conn.execute(
-          `INSERT INTO wiadomosci
-             (nadawca_email, odbiorca_email, przejazd_id, tresc, czas)
-           VALUES (?,             ?,               ?,           ?,    ?)`,
-          [from, to, rideId, content, ts]
-        );
-        await conn.end();
-      } catch (err) {
-        console.error("Błąd zapisu czatu:", err);
-      }
-    })();
-  });
+      // Wybierz odbiorcę
+      const receiverEmail = senderEmail === pasEmail ? kierEmail : pasEmail;
+
+      // Wstaw rekord
+      await conn.execute(
+        `INSERT INTO wiadomosci
+           (nadawca_email, odbiorca_email, przejazd_id, tresc, czas)
+         VALUES (?,             ?,               ?,           ?,    ?)`,
+        [senderEmail, receiverEmail, rideId, message, ts]
+      );
+
+      await conn.end();
+    } catch (err) {
+      console.error("Błąd zapisu czatu:", err);
+    }
+  })();
+});
   socket.on("disconnect", () => {
   });
 });
+
 
 server.listen(port, () =>
   console.log(`Serwer działa na porcie http://localhost:${port}`)
