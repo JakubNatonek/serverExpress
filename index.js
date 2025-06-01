@@ -515,10 +515,14 @@ app.get("/bliscy/", authenticateToken, async (req, res) => {
   // console.log(req)
   const uzytkownik_id = user.id;
   const promien = 100; // domyślnie 5 km
-  const query = `
+const query = `
     SELECT 
       l2.uzytkownik_id,
       u.imie AS imie_kierowcy,
+      k.model_pojazdu,
+      k.nr_rejestracyjny,
+      k.kolor_pojazdu,
+      k.ocena,
       (
         6371 * acos(
           cos(radians(l1.szerokosc_geo)) * 
@@ -531,6 +535,7 @@ app.get("/bliscy/", authenticateToken, async (req, res) => {
     FROM lokalizacje l1
     JOIN lokalizacje l2 ON l1.uzytkownik_id != l2.uzytkownik_id
     JOIN uzytkownicy u ON l2.uzytkownik_id = u.id
+    JOIN kierowcy k ON l2.uzytkownik_id = k.uzytkownik_id
     JOIN rola_as_uzytkownik rau ON u.id = rau.uzytkownik_id
     WHERE l1.uzytkownik_id = ?
       AND rau.rola_id = 3 -- Tylko użytkownicy z rolą kierowca
