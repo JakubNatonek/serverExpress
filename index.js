@@ -113,6 +113,16 @@ const does_user_exist = async (email) => {
   }
 };
 
+
+//============REGISTER======================
+
+// Importuj modele Sequelize (dodaj na początku pliku, po innych importach)
+const User = require("./models/user");
+const Role = require("./models/Role");
+const UserRole = require("./models/UserRole");
+const sequelize = require('./models/Config');
+
+
 app.post("/register", async (req, res) => {
   try {
     const { iv, data } = req.body;
@@ -122,36 +132,46 @@ app.post("/register", async (req, res) => {
     const haslo_hash = decryptedData.password;
 
     try {
-      // Check if user already exists
-      const exist = await does_user_exist(email);
+      // Sprawdź czy użytkownik już istnieje
+      const existingUser = await User.findOne({
+        where: { email: email }
+      });
 
-      if (exist) {
+      if (existingUser) {
         return res
           .status(400)
           .json({ message: "Użytkownik o tym adresie e-mail już istnieje." });
       }
 
-      // Dodaj użytkownika do bazy
-      const connection = await connectDB();
-      const [userResult] = await connection.execute(
-        `INSERT INTO uzytkownicy (imie, email, telefon, haslo_hash, typ_uzytkownika, data_utworzenia) 
-         VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
-        ["NULL", email, "NULL", haslo_hash, "pasażer"]
-      );
+      // Użyj transakcji Sequelize dla atomowej operacji
+      const result = await sequelize.transaction(async (t) => {
+        // Dodaj użytkownika używając Sequelize
+        const newUser = await User.create({
+          imie: "NULL",
+          email: email,
+          telefon: "NULL",
+          haslo_hash: haslo_hash,
+          data_utworzenia: sequelize.literal('CURRENT_TIMESTAMP')
+        }, { transaction: t });
 
-      const userId = userResult.insertId;
+        // Dodaj rolę (domyślnie pasażer = 2)
+        await UserRole.create({
+          uzytkownik_id: newUser.id,
+          rola_id: 2
+        }, { transaction: t });
 
-      // Dodaj rolę do rola_as_uzytkownik (domyślnie pasażer = 2)
-      await connection.execute(
-        `INSERT INTO rola_as_uzytkownik (uzytkownik_id, rola_id) VALUES (?, ?)`,
-        [userId, 2]
-      );
+        return newUser;
+      });
 
-      await connection.end();
+      // Generuj token dla nowego użytkownika (roleId = 2 pasażer)
+      const token = generateToken(email, 2, result.id);
 
       return res
         .status(201)
-        .json({ message: "Użytkownik dodany pomyślnie!", userId });
+        .json({ 
+          message: "Użytkownik dodany pomyślnie!", 
+          token: token  // Dodaję token do odpowiedzi
+        });
     } catch (err) {
       console.error("Błąd podczas dodawania użytkownika:", err);
       return res
@@ -163,20 +183,10 @@ app.post("/register", async (req, res) => {
     return res.status(500).json({ message: "Błąd dekodowania danych" });
   }
 });
+//================TEST==LOGOWANIE==================
 
-const login_user = async (email, haslo_hash) => {
-  const connection = await connectDB();
-  const query = "SELECT * FROM uzytkownicy WHERE email = ? AND haslo_hash = ?";
+// Zastąp istniejący endpoint /login nowym kodem
 
-  try {
-    const [results] = await connection.execute(query, [email, haslo_hash]);
-    await connection.end();
-    return results[0]; // Zwraca typ użytkownika
-  } catch (err) {
-    await connection.end();
-    throw err;
-  }
-};
 
 app.post("/login", async (req, res) => {
   try {
@@ -186,30 +196,39 @@ app.post("/login", async (req, res) => {
     const haslo_hash = decryptedData.password;
 
     try {
-      const user = await login_user(email, haslo_hash);
+      // Znajdź użytkownika po emailu i haśle
+      const user = await User.findOne({
+        where: {
+          email: email,
+          haslo_hash: haslo_hash,
+        },
+      });
+
       if (!user) {
         return res
           .status(400)
           .json({ message: "Niepoprawny adres e-mail lub hasło." });
       }
 
-      // Otwórz nowe połączenie do pobrania roli
-      const connection = await connectDB();
-      const [roleRows] = await connection.execute(
-        "SELECT rola_id FROM rola_as_uzytkownik WHERE uzytkownik_id = ?",
-        [user.id]
-      );
-      await connection.end();
+      // Pobierz rolę użytkownika
+      const userRole = await UserRole.findOne({
+        where: {
+          uzytkownik_id: user.id,
+        },
+      });
 
-      const roleId = roleRows.length ? roleRows[0].rola_id : null;
-      
+      const roleId = userRole ? userRole.rola_id : null;
+
       // Sprawdź czy konto nie jest zamknięte (rola_id = 4)
       if (roleId === 4) {
         return res
           .status(403)
-          .json({ message: "Konto zostało zamknięte. Skontaktuj się z administratorem." });
+          .json({
+            message:
+              "Konto zostało zamknięte. Skontaktuj się z administratorem.",
+          });
       }
-      
+
       const token = generateToken(email, roleId, user.id);
 
       return res.status(200).json({ message: "Zalogowano pomyślnie!", token });
@@ -225,6 +244,10 @@ app.post("/login", async (req, res) => {
   }
 });
 
+
+
+//==============KONIEC========================
+
 function authenticateToken(req, res, next) {
   const authHeader = req.headers.authorization;
   const token = authHeader && authHeader.split(" ")[1];
@@ -239,8 +262,6 @@ function authenticateToken(req, res, next) {
     next();
   });
 }
-
-
 
 //--------------------------------------------------------------------------------------------------------------------- Poczatek zmian
 
@@ -258,9 +279,11 @@ function authorizeRole(...allowedRoleIds) {
 app.get("/roles", authenticateToken, async (req, res) => {
   try {
     const connection = await connectDB();
-    const [rows] = await connection.execute("SELECT ID as id, przywilej as nazwa FROM role");
+    const [rows] = await connection.execute(
+      "SELECT ID as id, przywilej as nazwa FROM role"
+    );
     await connection.end();
-    
+
     // Zaszyfruj dane przed wysłaniem
     const encryptedData = await encryptData(rows);
     res.json(encryptedData);
@@ -270,14 +293,10 @@ app.get("/roles", authenticateToken, async (req, res) => {
 });
 
 // Pobierz użytkowników z nazwą roli (JOIN)
-app.get(
-  "/users",
-  authenticateToken,
-  authorizeRole(1),
-  async (req, res) => {
-    try {
-      const connection = await connectDB();
-      const [rows] = await connection.execute(`
+app.get("/users", authenticateToken, authorizeRole(1), async (req, res) => {
+  try {
+    const connection = await connectDB();
+    const [rows] = await connection.execute(`
         SELECT 
           u.id, u.imie, u.email, u.telefon, u.data_utworzenia,
           r.ID AS rola_id, r.przywilej AS rola_nazwa
@@ -285,53 +304,47 @@ app.get(
         LEFT JOIN rola_as_uzytkownik rau ON u.id = rau.uzytkownik_id
         LEFT JOIN role r ON rau.rola_id = r.ID
       `);
-      await connection.end();
-      
-      // Szyfrowanie danych
-      const encryptedData = await encryptData(rows);
-      res.json(encryptedData);
-    } catch (err) {
-      console.error("Error fetching data: ", err);
-      return res.status(500).json({ message: "Błąd" });
-    }
+    await connection.end();
+
+    // Szyfrowanie danych
+    const encryptedData = await encryptData(rows);
+    res.json(encryptedData);
+  } catch (err) {
+    console.error("Error fetching data: ", err);
+    return res.status(500).json({ message: "Błąd" });
   }
-);
+});
 
 // Dodaj nowego użytkownika z rolą
-app.post(
-  "/users",
-  authenticateToken,
-  authorizeRole(1),
-  async (req, res) => {
-    try {
-      // Odszyfrowanie danych
-      const { iv, data } = req.body;
-      const decryptedData = decryptData(iv, data);
-      
-      const { email, imie, telefon, haslo, rola_id } = decryptedData;
-      if (!email || !haslo)
-        return res.status(400).json({ message: "Email i hasło są wymagane" });
-      
-      const connection = await connectDB();
-      // Dodaj użytkownika
-      const [userResult] = await connection.execute(
-        `INSERT INTO uzytkownicy (imie, email, telefon, haslo_hash, data_utworzenia)
+app.post("/users", authenticateToken, authorizeRole(1), async (req, res) => {
+  try {
+    // Odszyfrowanie danych
+    const { iv, data } = req.body;
+    const decryptedData = decryptData(iv, data);
+
+    const { email, imie, telefon, haslo, rola_id } = decryptedData;
+    if (!email || !haslo)
+      return res.status(400).json({ message: "Email i hasło są wymagane" });
+
+    const connection = await connectDB();
+    // Dodaj użytkownika
+    const [userResult] = await connection.execute(
+      `INSERT INTO uzytkownicy (imie, email, telefon, haslo_hash, data_utworzenia)
          VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)`,
-        [imie, email, telefon, haslo]
-      );
-      const userId = userResult.insertId;
-      // Dodaj rolę do rola_as_uzytkownik
-      await connection.execute(
-        `INSERT INTO rola_as_uzytkownik (uzytkownik_id, rola_id) VALUES (?, ?)`,
-        [userId, rola_id || 2]
-      );
-      await connection.end();
-      res.status(201).json({ message: "Użytkownik dodany" });
-    } catch (err) {
-      res.status(500).json({ message: "Błąd podczas dodawania użytkownika" });
-    }
+      [imie, email, telefon, haslo]
+    );
+    const userId = userResult.insertId;
+    // Dodaj rolę do rola_as_uzytkownik
+    await connection.execute(
+      `INSERT INTO rola_as_uzytkownik (uzytkownik_id, rola_id) VALUES (?, ?)`,
+      [userId, rola_id || 2]
+    );
+    await connection.end();
+    res.status(201).json({ message: "Użytkownik dodany" });
+  } catch (err) {
+    res.status(500).json({ message: "Błąd podczas dodawania użytkownika" });
   }
-);
+});
 
 // Edytuj użytkownika (dane)
 app.put(
@@ -341,30 +354,28 @@ app.put(
   async (req, res) => {
     try {
       const { email } = req.params;
-      
+
       // Odszyfrowanie danych
       const { iv, data } = req.body;
       const decryptedData = decryptData(iv, data);
-      
+
       const { imie = "", telefon = "" } = decryptedData;
-      
+
       const connection = await connectDB();
       const query = `
         UPDATE uzytkownicy SET imie=?, telefon=?
         WHERE email=?
       `;
-      const [result] = await connection.execute(query, [
-        imie,
-        telefon,
-        email,
-      ]);
+      const [result] = await connection.execute(query, [imie, telefon, email]);
       await connection.end();
       if (result.affectedRows === 0) {
         return res.status(404).json({ message: "Nie znaleziono użytkownika" });
       }
       res.status(200).json({ message: "Użytkownik zaktualizowany" });
     } catch (err) {
-      res.status(500).json({ message: "Błąd podczas aktualizacji użytkownika" });
+      res
+        .status(500)
+        .json({ message: "Błąd podczas aktualizacji użytkownika" });
     }
   }
 );
@@ -377,15 +388,15 @@ app.put(
   async (req, res) => {
     try {
       const { email } = req.params;
-      
+
       // Odszyfrowanie danych
       const { iv, data } = req.body;
       const decryptedData = decryptData(iv, data);
-      
+
       const { rola_id } = decryptedData;
-      
+
       if (!rola_id) return res.status(400).json({ message: "Brak roli" });
-      
+
       const connection = await connectDB();
       // Pobierz id użytkownika
       const [userRows] = await connection.execute(
@@ -418,13 +429,13 @@ app.delete(
   async (req, res) => {
     try {
       const { email } = req.params;
-      
+
       // W przypadku DELETE może nie być body, ale gdyby było, można odszyfrować
       let decryptedData = {};
       if (req.body && req.body.iv && req.body.data) {
         decryptedData = decryptData(req.body.iv, req.body.data);
       }
-      
+
       const connection = await connectDB();
       // Pobierz id użytkownika
       const [userRows] = await connection.execute(
@@ -541,7 +552,6 @@ app.get("/bliscy/", authenticateToken, async (req, res) => {
   }
 });
 
-
 app.post("/zlecenia", authenticateToken, async (req, res) => {
   const user = req.user; // Dane użytkownika z tokena
   const { iv, data } = req.body;
@@ -577,7 +587,9 @@ app.post("/zlecenia", authenticateToken, async (req, res) => {
       await connection.end();
       return res
         .status(400)
-        .json({ message: "Masz już aktywny przejazd. Nie możesz zamówić nowego." });
+        .json({
+          message: "Masz już aktywny przejazd. Nie możesz zamówić nowego.",
+        });
     }
 
     // Sprawdzenie, czy kierowca ma już przejazd o statusie 2
@@ -586,15 +598,19 @@ app.post("/zlecenia", authenticateToken, async (req, res) => {
       FROM przejazdy
       WHERE kierowca_id = ? AND status_id = 2
     `;
-    const [driverResult] = await connection.execute(checkDriverQuery, [kierowca_id]);
+    const [driverResult] = await connection.execute(checkDriverQuery, [
+      kierowca_id,
+    ]);
 
     if (driverResult[0].activeDriverRides > 0) {
       await connection.end();
       return res
         .status(400)
-        .json({ message: "Wybrany kierowca ma już aktywny przejazd. Nie można przypisać nowego." });
+        .json({
+          message:
+            "Wybrany kierowca ma już aktywny przejazd. Nie można przypisać nowego.",
+        });
     }
-
 
     // Dodanie nowego przejazdu
     const query = `
@@ -676,13 +692,15 @@ app.put("/zlecenia/:id/status", authenticateToken, async (req, res) => {
     //console.log(decryptedData)
 
     if (!status_id) {
-      return res.status(400).json({ message: "Brak statusu do zaktualizowania" });
+      return res
+        .status(400)
+        .json({ message: "Brak statusu do zaktualizowania" });
     }
 
     const connection = await connectDB();
     let query;
     let params;
-    
+
     if (status_id === 3 || status_id === 4) {
       query = `
         UPDATE przejazdy
@@ -715,7 +733,9 @@ app.put("/zlecenia/:id/status", authenticateToken, async (req, res) => {
         return res.status(404).json({ message: "Nie znaleziono zlecenia" });
       }
 
-      res.status(200).json({ message: "Status zlecenia został zaktualizowany" });
+      res
+        .status(200)
+        .json({ message: "Status zlecenia został zaktualizowany" });
     } catch (err) {
       console.error("Błąd podczas aktualizowania statusu zlecenia:", err);
       await connection.end();
@@ -726,7 +746,6 @@ app.put("/zlecenia/:id/status", authenticateToken, async (req, res) => {
     res.status(500).json({ message: "Błąd dekodowania danych" });
   }
 });
-
 
 //--------------------------------------------------------------------------------------------------------------------- Poczatek zmian ACL
 
@@ -790,33 +809,36 @@ app.get("/chats", authenticateToken, async (req, res) => {
   }
 });
 
-
 // Get chat history for a specific ride
 app.get("/chats/:rideId/history", authenticateToken, async (req, res) => {
   try {
     const { rideId } = req.params;
     const userId = req.user.id;
-    
+
     // Verify user has access to this ride's chat
     const connection = await connectDB();
     const [rideCheck] = await connection.execute(
       "SELECT pasazer_id, kierowca_id FROM przejazdy WHERE id = ?",
       [rideId]
     );
-    
+
     if (!rideCheck.length) {
       await connection.end();
       return res.status(404).json({ message: "Nie znaleziono przejazdu" });
     }
-    
+
     const { pasazer_id, kierowca_id } = rideCheck[0];
-    
+
     // Only allow passengers, drivers, or admins to access chat history
-    if (userId !== pasazer_id && userId !== kierowca_id && req.user.roleId !== 1) {
+    if (
+      userId !== pasazer_id &&
+      userId !== kierowca_id &&
+      req.user.roleId !== 1
+    ) {
       await connection.end();
       return res.status(403).json({ message: "Brak uprawnień" });
     }
-    
+
     // Fetch chat history
     const [history] = await connection.execute(
       `SELECT 
@@ -828,13 +850,12 @@ app.get("/chats/:rideId/history", authenticateToken, async (req, res) => {
        ORDER BY czas ASC`,
       [rideId]
     );
-    
+
     await connection.end();
-    
+
     // Encrypt data before sending
     const encryptedData = await encryptData(history);
     res.json(encryptedData);
-    
   } catch (err) {
     console.error("Error fetching chat history:", err);
     res.status(500).json({ message: "Błąd serwera" });
@@ -846,7 +867,7 @@ app.delete("/chats/:id", authenticateToken, async (req, res) => {
   try {
     const chatId = req.params.id; // This is actually the ride ID
     const { reason } = req.body;
-    
+
     // Verify the user has permission to delete this chat
     // (either the passenger or driver of this ride)
     const connection = await connectDB();
@@ -854,23 +875,25 @@ app.delete("/chats/:id", authenticateToken, async (req, res) => {
       "SELECT pasazer_id, kierowca_id FROM przejazdy WHERE id = ?",
       [chatId]
     );
-    
+
     if (!rideCheck.length) {
       await connection.end();
       return res.status(404).json({ message: "Nie znaleziono przejazdu" });
     }
-  
+
     const [result] = await connection.execute(
       "UPDATE przejazdy SET status_id = 5 WHERE id = ?",
       [chatId]
     );
-    
+
     await connection.end();
-    
+
     if (result.affectedRows === 0) {
-      return res.status(500).json({ message: "Nie udało się zaktualizować statusu przejazdu" });
+      return res
+        .status(500)
+        .json({ message: "Nie udało się zaktualizować statusu przejazdu" });
     }
-    
+
     res.status(200).json({ message: "Czat i przejazd zostały zamknięte" });
   } catch (err) {
     console.error("Error deleting chat:", err);
@@ -880,7 +903,7 @@ app.delete("/chats/:id", authenticateToken, async (req, res) => {
 
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: "http://localhost:8100", methods: ["GET","POST"] }
+  cors: { origin: "http://localhost:8100", methods: ["GET", "POST"] },
 });
 
 io.on("connection", (socket) => {
@@ -889,7 +912,7 @@ io.on("connection", (socket) => {
   socket.on("joinRoom", async ({ rideId }) => {
     const room = `ride-${rideId}`;
     socket.join(room);
-  
+
     try {
       const conn = await connectDB();
       const [history] = await conn.execute(
@@ -910,83 +933,79 @@ io.on("connection", (socket) => {
   });
 
   socket.on("sendMessage", async ({ rideId, senderEmail, message }) => {
-  // 1) Przytnij timestamp do formatu MySQL DATETIME
-  const ts = new Date()
-    .toISOString()
-    .slice(0, 19)
-    .replace("T", " ");
+    // 1) Przytnij timestamp do formatu MySQL DATETIME
+    const ts = new Date().toISOString().slice(0, 19).replace("T", " ");
 
-  // 2) Pobierz imię nadawcy
-  let senderName = "Nieznany";
-  try {
-    const connName = await connectDB();
-    const [nameRows] = await connName.execute(
-      "SELECT imie FROM uzytkownicy WHERE email = ?",
-      [senderEmail]
-    );
-    await connName.end();
-    if (nameRows.length) senderName = nameRows[0].imie;
-  } catch (e) {
-    console.error("Błąd pobierania imienia:", e);
-  }
+    // 2) Pobierz imię nadawcy
+    let senderName = "Nieznany";
+    try {
+      const connName = await connectDB();
+      const [nameRows] = await connName.execute(
+        "SELECT imie FROM uzytkownicy WHERE email = ?",
+        [senderEmail]
+      );
+      await connName.end();
+      if (nameRows.length) senderName = nameRows[0].imie;
+    } catch (e) {
+      console.error("Błąd pobierania imienia:", e);
+    }
 
-  // 3) Emituj do pozostałych w pokoju, podając też rideId i senderName
-  socket.broadcast
-    .to(`ride-${rideId}`)
-    .emit("receiveMessage", {
+    // 3) Emituj do pozostałych w pokoju, podając też rideId i senderName
+    socket.broadcast.to(`ride-${rideId}`).emit("receiveMessage", {
       rideId,
       senderEmail,
       senderName,
       message,
-      timestamp: ts
+      timestamp: ts,
     });
 
-  // 4) Zapisz w bazie w tle
-  (async () => {
-    try {
-      const conn = await connectDB();
+    // 4) Zapisz w bazie w tle
+    (async () => {
+      try {
+        const conn = await connectDB();
 
-      // Pobierz pasazer_id i kierowca_id
-      const [tripRows] = await conn.execute(
-        "SELECT pasazer_id, kierowca_id FROM przejazdy WHERE id = ?",
-        [rideId]
-      );
-      if (!tripRows.length) { await conn.end(); return; }
-      const { pasazer_id, kierowca_id } = tripRows[0];
+        // Pobierz pasazer_id i kierowca_id
+        const [tripRows] = await conn.execute(
+          "SELECT pasazer_id, kierowca_id FROM przejazdy WHERE id = ?",
+          [rideId]
+        );
+        if (!tripRows.length) {
+          await conn.end();
+          return;
+        }
+        const { pasazer_id, kierowca_id } = tripRows[0];
 
-      // Pobierz emaile obu stron
-      const [pasRows] = await conn.execute(
-        "SELECT email FROM uzytkownicy WHERE id = ?",
-        [pasazer_id]
-      );
-      const [kierRows] = await conn.execute(
-        "SELECT email FROM uzytkownicy WHERE id = ?",
-        [kierowca_id]
-      );
-      const pasEmail  = pasRows[0]?.email  ?? null;
-      const kierEmail = kierRows[0]?.email ?? null;
+        // Pobierz emaile obu stron
+        const [pasRows] = await conn.execute(
+          "SELECT email FROM uzytkownicy WHERE id = ?",
+          [pasazer_id]
+        );
+        const [kierRows] = await conn.execute(
+          "SELECT email FROM uzytkownicy WHERE id = ?",
+          [kierowca_id]
+        );
+        const pasEmail = pasRows[0]?.email ?? null;
+        const kierEmail = kierRows[0]?.email ?? null;
 
-      // Wybierz odbiorcę
-      const receiverEmail = senderEmail === pasEmail ? kierEmail : pasEmail;
+        // Wybierz odbiorcę
+        const receiverEmail = senderEmail === pasEmail ? kierEmail : pasEmail;
 
-      // Wstaw rekord
-      await conn.execute(
-        `INSERT INTO wiadomosci
+        // Wstaw rekord
+        await conn.execute(
+          `INSERT INTO wiadomosci
            (nadawca_email, odbiorca_email, przejazd_id, tresc, czas)
          VALUES (?,             ?,               ?,           ?,    ?)`,
-        [senderEmail, receiverEmail, rideId, message, ts]
-      );
+          [senderEmail, receiverEmail, rideId, message, ts]
+        );
 
-      await conn.end();
-    } catch (err) {
-      console.error("Błąd zapisu czatu:", err);
-    }
-  })();
-});
-  socket.on("disconnect", () => {
+        await conn.end();
+      } catch (err) {
+        console.error("Błąd zapisu czatu:", err);
+      }
+    })();
   });
+  socket.on("disconnect", () => {});
 });
-
 
 server.listen(port, () =>
   console.log(`Serwer działa na porcie http://localhost:${port}`)
@@ -1004,7 +1023,8 @@ app.get("/profile", authenticateToken, async (req, res) => {
       [userId]
     );
     await connection.end();
-    if (!rows.length) return res.status(404).json({ message: "Nie znaleziono użytkownika" });
+    if (!rows.length)
+      return res.status(404).json({ message: "Nie znaleziono użytkownika" });
     res.json(rows[0]);
   } catch (err) {
     res.status(500).json({ message: "Błąd pobierania profilu" });
@@ -1028,7 +1048,6 @@ app.put("/profile", authenticateToken, async (req, res) => {
   }
 });
 
-
 app.delete("/profile", authenticateToken, async (req, res) => {
   const userId = req.user.id;
   try {
@@ -1037,17 +1056,13 @@ app.delete("/profile", authenticateToken, async (req, res) => {
       "DELETE FROM rola_as_uzytkownik WHERE uzytkownik_id=?",
       [userId]
     );
-    await connection.execute(
-      "DELETE FROM uzytkownicy WHERE id=?",
-      [userId]
-    );
+    await connection.execute("DELETE FROM uzytkownicy WHERE id=?", [userId]);
     await connection.end();
     res.json({ message: "Konto usunięte" });
   } catch (err) {
     res.status(500).json({ message: "Błąd usuwania konta" });
   }
 });
-
 
 app.put("/profile/password", authenticateToken, async (req, res) => {
   const userId = req.user.id;
@@ -1072,10 +1087,10 @@ app.put("/profile/password", authenticateToken, async (req, res) => {
       return res.status(400).json({ message: "Stare hasło nieprawidłowe" });
     }
     // Zmień hasło na nowe (już zahashowane)
-    await connection.execute(
-      "UPDATE uzytkownicy SET haslo_hash=? WHERE id=?",
-      [newPassword, userId]
-    );
+    await connection.execute("UPDATE uzytkownicy SET haslo_hash=? WHERE id=?", [
+      newPassword,
+      userId,
+    ]);
     await connection.end();
     res.status(200).json({ message: "Hasło zmienione" });
   } catch (err) {
@@ -1084,7 +1099,6 @@ app.put("/profile/password", authenticateToken, async (req, res) => {
 });
 
 //--------------------------------------------------------------------------------------------------------------------- Koniec zmian PROFIL
-
 
 //--------------------------------------------------------------------------------------------------------------------- Poczatek zmian ADMIN-Przeajzdy
 
@@ -1128,7 +1142,6 @@ app.get(
   }
 );
 
-
 app.get(
   "/admin/rides/:id",
   authenticateToken,
@@ -1153,19 +1166,22 @@ app.get(
       `;
       const [rows] = await connection.execute(query, [rideId]);
       await connection.end();
-      
+
       if (!rows.length) {
         return res.status(404).json({ message: "Przejazd nie istnieje" });
       }
-      
+
       // Upewniamy się, że trasa_przejazdu jest w odpowiednim formacie
       const rideData = rows[0];
-      
+
       // Jeśli trasa_przejazdu jest ciągiem JSON, zamień go na ciąg tekstowy
-      if (typeof rideData.trasa_przejazdu === 'string') {
+      if (typeof rideData.trasa_przejazdu === "string") {
         try {
           // Sprawdź, czy to możliwy JSON string
-          if (rideData.trasa_przejazdu.startsWith('{') || rideData.trasa_przejazdu.startsWith('[')) {
+          if (
+            rideData.trasa_przejazdu.startsWith("{") ||
+            rideData.trasa_przejazdu.startsWith("[")
+          ) {
             // Jeśli to JSON, parsuj go, aby uzyskać wartość polyline
             const parsedRoute = JSON.parse(rideData.trasa_przejazdu);
             // Zakładamy, że polyline jest przechowywane jako string wewnątrz JSON
@@ -1178,7 +1194,7 @@ app.get(
           // Jeśli parsowanie nie powiodło się, pozostawiamy oryginalną wartość
         }
       }
-      
+
       const data = await encryptData(rideData);
       res.json(data);
     } catch (err) {
@@ -1187,7 +1203,6 @@ app.get(
   }
 );
 
-
 app.put(
   "/admin/rides/:id",
   authenticateToken,
@@ -1195,17 +1210,17 @@ app.put(
   async (req, res) => {
     try {
       const rideId = req.params.id;
-      
+
       // Sprawdzamy czy dane są w oczekiwanym formacie
       if (!req.body || !req.body.iv || !req.body.data) {
         return res.status(400).json({ message: "Nieprawidłowy format danych" });
       }
-      
+
       const { iv, data } = req.body;
-      
+
       try {
         const decryptedData = decryptData(iv, data);
-        
+
         // Weryfikacja czy mamy wszystkie wymagane pola
         const {
           pasazer_id,
@@ -1214,26 +1229,26 @@ app.put(
           dystans_km,
           status_id,
           data_rozpoczecia,
-          data_zakonczenia
+          data_zakonczenia,
         } = decryptedData;
-        
+
         if (!cena || !dystans_km || !status_id) {
           return res.status(400).json({ message: "Brakuje wymaganych pól" });
         }
-        
+
         const connection = await connectDB();
-        
+
         // Znajdź istniejący przejazd, aby zachować pola, których nie edytujemy
         const [existingRide] = await connection.execute(
           "SELECT * FROM przejazdy WHERE id = ?",
           [rideId]
         );
-        
+
         if (!existingRide.length) {
           await connection.end();
           return res.status(404).json({ message: "Przejazd nie istnieje" });
         }
-        
+
         // Aktualizuj tylko pola, które mogą być edytowane z frontu
         const query = `
           UPDATE przejazdy
@@ -1243,20 +1258,22 @@ app.put(
             status_id = ?
           WHERE id = ?
         `;
-        
+
         const [result] = await connection.execute(query, [
           cena,
           dystans_km,
           status_id,
-          rideId
+          rideId,
         ]);
-        
+
         await connection.end();
-        
+
         if (result.affectedRows === 0) {
-          return res.status(404).json({ message: "Przejazd nie został zaktualizowany" });
+          return res
+            .status(404)
+            .json({ message: "Przejazd nie został zaktualizowany" });
         }
-        
+
         res.json({ message: "Przejazd zaktualizowany" });
       } catch (decryptError) {
         return res.status(400).json({ message: "Błąd dekryptowania danych" });
@@ -1276,19 +1293,19 @@ app.delete(
     try {
       const rideId = req.params.id;
       const connection = await connectDB();
-      
+
       // Zamiast usuwać, zmieniamy status na 5 (anulowany/zamknięty)
       const [result] = await connection.execute(
         "UPDATE przejazdy SET status_id = 5, data_zakonczenia = NOW() WHERE id = ?",
         [rideId]
       );
-      
+
       await connection.end();
-      
+
       if (result.affectedRows === 0) {
         return res.status(404).json({ message: "Przejazd nie istnieje" });
       }
-      
+
       res.json({ message: "Przejazd anulowany" });
     } catch (err) {
       res.status(500).json({ message: "Błąd serwera" });
@@ -1317,10 +1334,10 @@ app.get(
           COUNT(CASE WHEN status_id = 5 THEN 1 END) AS closed_rides
         FROM przejazdy
       `;
-      
+
       const [rows] = await connection.execute(query);
       await connection.end();
-      
+
       // Konwersja wartości na liczby przed wysłaniem do klienta
       const stats = rows[0];
       const formattedStats = {
@@ -1332,9 +1349,9 @@ app.get(
         active_rides: Number(stats.active_rides),
         completed_rides: Number(stats.completed_rides),
         cancelled_rides: Number(stats.cancelled_rides),
-        closed_rides: Number(stats.closed_rides)
+        closed_rides: Number(stats.closed_rides),
       };
-      
+
       const data = await encryptData(formattedStats);
       res.json(data);
     } catch (err) {
@@ -1351,7 +1368,9 @@ app.get(
   async (req, res) => {
     try {
       const connection = await connectDB();
-      const [rows] = await connection.execute("SELECT * FROM statusy_przejazdu");
+      const [rows] = await connection.execute(
+        "SELECT * FROM statusy_przejazdu"
+      );
       await connection.end();
       res.json(rows);
     } catch (err) {
@@ -1380,11 +1399,11 @@ app.post("/oceny", authenticateToken, async (req, res) => {
     }
 
     const connection = await connectDB();
-    
+
     try {
       // Rozpoczęcie transakcji
       await connection.beginTransaction();
-      
+
       // 1. Dodaj ocenę kierowcy
       const query = `
         INSERT INTO oceny_kierowcow 
@@ -1397,16 +1416,21 @@ app.post("/oceny", authenticateToken, async (req, res) => {
         pasazer_id,
         przejazd_id,
         ocena,
-        komentarz || null
+        komentarz || null,
       ]);
-      
+
       // 2. Aktualizuj średnią ocenę kierowcy
       await connection.execute("CALL UpdateDriverRating(?)", [kierowca_id]);
-      
+
       // Zatwierdź transakcję
       await connection.commit();
-      
-      res.status(201).json({ message: "Ocena została zapisana i średnia ocena kierowcy zaktualizowana" });
+
+      res
+        .status(201)
+        .json({
+          message:
+            "Ocena została zapisana i średnia ocena kierowcy zaktualizowana",
+        });
     } catch (err) {
       // W przypadku błędu wycofaj transakcję
       await connection.rollback();
@@ -1422,13 +1446,12 @@ app.post("/oceny", authenticateToken, async (req, res) => {
 
 //--------------------------------------------------------------------------------------------------------------------- Koniec zmian Zakończenie przejazdu
 
-
 // GET payments - can filter by ride ID or user ID
 app.get("/platnosci", authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
     const { przejazd_id } = req.query;
-    
+
     const connection = await connectDB();
     let query = `
       SELECT 
@@ -1441,20 +1464,20 @@ app.get("/platnosci", authenticateToken, async (req, res) => {
       FROM platnosci p
       JOIN uzytkownicy u ON p.id_uzytkownika = u.id
     `;
-    
+
     const params = [];
-    
+
     // Only admins can see all payments, users see only their own
     if (req.user.roleId !== 1) {
       query += ` AND p.id_uzytkownika = ?`;
       params.push(userId);
     }
-    
+
     query += ` ORDER BY p.data DESC`;
-    
+
     const [rows] = await connection.execute(query, params);
     await connection.end();
-    
+
     // Encrypt data before sending
     const encryptedData = await encryptData(rows);
     res.json(encryptedData);
@@ -1468,34 +1491,34 @@ app.get("/platnosci", authenticateToken, async (req, res) => {
 app.post("/platnosci", authenticateToken, async (req, res) => {
   try {
     const { iv, data } = req.body;
-    
+
     if (!iv || !data) {
       return res.status(400).json({ message: "Brak danych" });
     }
-    
+
     // Decrypt request data
     const decryptedData = decryptData(iv, data);
     const { przejazd_id, kwota } = decryptedData;
     const id_uzytkownika = req.user.id;
-    console.log(przejazd_id, kwota)
+    console.log(przejazd_id, kwota);
     if (!przejazd_id || !kwota) {
       return res.status(400).json({ message: "Brak wymaganych danych" });
     }
-    
+
     const connection = await connectDB();
-    
+
     try {
       // Add payment
       const [result] = await connection.execute(
         "INSERT INTO platnosci (przejazd_id, kwota, data, id_uzytkownika) VALUES (?, ?, NOW(), ?)",
         [przejazd_id, kwota, id_uzytkownika]
       );
-      
+
       await connection.end();
-      
-      res.status(201).json({ 
-        message: "Płatność zapisana", 
-        id: result.insertId 
+
+      res.status(201).json({
+        message: "Płatność zapisana",
+        id: result.insertId,
       });
     } catch (err) {
       await connection.end();
