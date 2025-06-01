@@ -1583,4 +1583,356 @@ app.get("/api/reviews/:id", async (req, res) => {
 });
 //--------------------------------------------------------------------------------------------------------------------- Koniec zmian Ranking
 
+//--------------------------------------------------------------------------------------------------------------------- Początek zmian Ranking CRUD
+// Pobierz wszystkich kierowców z informacjami o użytkownikach
+app.get("/admin/drivers", authenticateToken, authorizeRole(1), async (req, res) => {
+  try {
+    const connection = await connectDB();
+    const query = `
+      SELECT 
+        k.uzytkownik_id,
+        u.imie,
+        u.email,
+        u.telefon,
+        u.data_utworzenia,
+        k.numer_prawa_jazdy,
+        k.model_pojazdu,
+        k.nr_rejestracyjny,
+        k.kolor_pojazdu,
+        k.ocena,
+        (SELECT COUNT(*) FROM oceny_kierowcow WHERE kierowca_id = k.uzytkownik_id) as liczba_ocen,
+        l.szerokosc_geo,
+        l.dlugosc_geo,
+        l.zaktualizowano
+      FROM 
+        kierowcy k
+      JOIN 
+        uzytkownicy u ON k.uzytkownik_id = u.id
+      LEFT JOIN 
+        lokalizacje l ON u.id = l.uzytkownik_id
+      ORDER BY 
+        u.data_utworzenia DESC
+    `;
+    const [rows] = await connection.execute(query);
 
+    // Formatuj dane, aby zawierały lokalizację jako zagnieżdżony obiekt jeśli jest dostępna
+    const formattedRows = rows.map(row => {
+      const driver = { ...row };
+      
+      // Jeśli mamy dane lokalizacyjne, utwórz z nich zagnieżdżony obiekt
+      if (row.szerokosc_geo !== null) {
+        driver.ostatnia_lokalizacja = {
+          szerokosc_geo: row.szerokosc_geo,
+          dlugosc_geo: row.dlugosc_geo,
+          zaktualizowano: row.zaktualizowano
+        };
+      }
+      
+      // Usuń surowe pola lokalizacji
+      delete driver.szerokosc_geo;
+      delete driver.dlugosc_geo;
+      delete driver.zaktualizowano;
+      
+      return driver;
+    });
+
+    await connection.end();
+    const encryptedData = await encryptData(formattedRows);
+    res.json(encryptedData);
+  } catch (err) {
+    console.error("Błąd podczas pobierania kierowców:", err);
+    res.status(500).json({ message: "Błąd serwera" });
+  }
+});
+
+// Pobierz kwalifikujących się użytkowników, którzy mogą zostać kierowcami (tych z rolą kierowcy, którzy jeszcze nie są kierowcami)
+app.get("/admin/eligible-drivers", authenticateToken, authorizeRole(1), async (req, res) => {
+  try {
+    const connection = await connectDB();
+    const query = `
+      SELECT 
+        u.id, u.imie, u.email
+      FROM 
+        uzytkownicy u
+      JOIN 
+        rola_as_uzytkownik rau ON u.id = rau.uzytkownik_id
+      WHERE 
+        rau.rola_id = 3  -- ID roli kierowcy
+        AND NOT EXISTS (
+          SELECT 1 FROM kierowcy k WHERE k.uzytkownik_id = u.id
+        )
+      ORDER BY 
+        u.imie, u.email
+    `;
+    const [rows] = await connection.execute(query);
+    await connection.end();
+    const encryptedData = await encryptData(rows);
+    res.json(encryptedData);
+  } catch (err) {
+    console.error("Błąd podczas pobierania kwalifikujących się kierowców:", err);
+    res.status(500).json({ message: "Błąd serwera" });
+  }
+});
+
+// Pobierz dane konkretnego kierowcy
+app.get("/admin/drivers/:id", authenticateToken, authorizeRole(1), async (req, res) => {
+  try {
+    const driverId = req.params.id;
+    const connection = await connectDB();
+    const query = `
+      SELECT 
+        k.*,
+        u.imie,
+        u.email,
+        u.telefon,
+        u.data_utworzenia
+      FROM 
+        kierowcy k
+      JOIN 
+        uzytkownicy u ON k.uzytkownik_id = u.id
+      WHERE 
+        k.uzytkownik_id = ?
+    `;
+    const [rows] = await connection.execute(query, [driverId]);
+    
+    if (rows.length === 0) {
+      await connection.end();
+      return res.status(404).json({ message: "Kierowca nie znaleziony" });
+    }
+    
+    await connection.end();
+    const encryptedData = await encryptData(rows[0]);
+    res.json(encryptedData);
+  } catch (err) {
+    console.error("Błąd podczas pobierania danych kierowcy:", err);
+    res.status(500).json({ message: "Błąd serwera" });
+  }
+});
+
+// Pobierz recenzje konkretnego kierowcy
+app.get("/admin/drivers/:id/reviews", authenticateToken, authorizeRole(1), async (req, res) => {
+  try {
+    const driverId = req.params.id;
+    const connection = await connectDB();
+    const query = `
+      SELECT 
+        o.id,
+        o.kierowca_id,
+        o.pasazer_id,
+        o.przejazd_id,
+        o.ocena,
+        o.komentarz,
+        o.data_oceny,
+        u.imie as user_name,
+        u.email as user_email
+      FROM 
+        oceny_kierowcow o
+      JOIN 
+        uzytkownicy u ON o.pasazer_id = u.id
+      WHERE 
+        o.kierowca_id = ?
+      ORDER BY 
+        o.data_oceny DESC
+    `;
+    const [rows] = await connection.execute(query, [driverId]);
+    await connection.end();
+    const encryptedData = await encryptData(rows);
+    res.json(encryptedData);
+  } catch (err) {
+    console.error("Błąd podczas pobierania recenzji kierowcy:", err);
+    res.status(500).json({ message: "Błąd serwera" });
+  }
+});
+
+// Dodaj nowego kierowcę
+app.post("/admin/drivers", authenticateToken, authorizeRole(1), async (req, res) => {
+  try {
+    const { iv, data } = req.body;
+    const decryptedData = decryptData(iv, data);
+    
+    const {
+      uzytkownik_id,
+      numer_prawa_jazdy,
+      model_pojazdu,
+      nr_rejestracyjny,
+      kolor_pojazdu
+    } = decryptedData;
+    
+    if (!uzytkownik_id) {
+      return res.status(400).json({ message: "Brak wymaganego ID użytkownika" });
+    }
+    
+    const connection = await connectDB();
+    
+    // Sprawdź czy użytkownik istnieje i ma rolę kierowcy
+    const [userCheck] = await connection.execute(`
+      SELECT u.id FROM uzytkownicy u
+      JOIN rola_as_uzytkownik r ON u.id = r.uzytkownik_id
+      WHERE u.id = ? AND r.rola_id = 3
+    `, [uzytkownik_id]);
+    
+    if (userCheck.length === 0) {
+      await connection.end();
+      return res.status(400).json({ message: "Użytkownik o podanym ID nie istnieje lub nie ma roli kierowcy" });
+    }
+    
+    // Sprawdź czy rekord kierowcy już istnieje
+    const [driverCheck] = await connection.execute(
+      "SELECT uzytkownik_id FROM kierowcy WHERE uzytkownik_id = ?",
+      [uzytkownik_id]
+    );
+    
+    if (driverCheck.length > 0) {
+      await connection.end();
+      return res.status(400).json({ message: "Ten użytkownik ma już dane kierowcy" });
+    }
+    
+    // Wstaw nowego kierowcę
+    const query = `
+      INSERT INTO kierowcy (
+        uzytkownik_id,
+        numer_prawa_jazdy,
+        model_pojazdu,
+        nr_rejestracyjny,
+        kolor_pojazdu,
+        ocena
+      ) VALUES (?, ?, ?, ?, ?, 5.00)
+    `;
+    
+    await connection.execute(query, [
+      uzytkownik_id,
+      numer_prawa_jazdy || null,
+      model_pojazdu || null,
+      nr_rejestracyjny || null,
+      kolor_pojazdu || null
+    ]);
+    
+    await connection.end();
+    res.status(201).json({ message: "Kierowca dodany pomyślnie" });
+  } catch (err) {
+    console.error("Błąd podczas dodawania kierowcy:", err);
+    res.status(500).json({ message: "Błąd serwera" });
+  }
+});
+
+// Zaktualizuj dane kierowcy
+app.put("/admin/drivers/:id", authenticateToken, authorizeRole(1), async (req, res) => {
+  try {
+    const driverId = req.params.id;
+    const { iv, data } = req.body;
+    const decryptedData = decryptData(iv, data);
+    
+    const {
+      numer_prawa_jazdy,
+      model_pojazdu,
+      nr_rejestracyjny,
+      kolor_pojazdu
+    } = decryptedData;
+    
+    const connection = await connectDB();
+    
+    // Sprawdź czy kierowca istnieje
+    const [driverCheck] = await connection.execute(
+      "SELECT uzytkownik_id FROM kierowcy WHERE uzytkownik_id = ?",
+      [driverId]
+    );
+    
+    if (driverCheck.length === 0) {
+      await connection.end();
+      return res.status(404).json({ message: "Kierowca nie znaleziony" });
+    }
+    
+    // Aktualizuj dane kierowcy
+    const query = `
+      UPDATE kierowcy SET
+        numer_prawa_jazdy = ?,
+        model_pojazdu = ?,
+        nr_rejestracyjny = ?,
+        kolor_pojazdu = ?
+      WHERE uzytkownik_id = ?
+    `;
+    
+    await connection.execute(query, [
+      numer_prawa_jazdy,
+      model_pojazdu,
+      nr_rejestracyjny,
+      kolor_pojazdu,
+      driverId
+    ]);
+    
+    await connection.end();
+    res.json({ message: "Dane kierowcy zaktualizowane" });
+  } catch (err) {
+    console.error("Błąd podczas aktualizowania danych kierowcy:", err);
+    res.status(500).json({ message: "Błąd serwera" });
+  }
+});
+
+// Usuń kierowcę
+app.delete("/admin/drivers/:id", authenticateToken, authorizeRole(1), async (req, res) => {
+  try {
+    const driverId = req.params.id;
+    const connection = await connectDB();
+    
+    // Najpierw sprawdź czy kierowca istnieje
+    const [driverCheck] = await connection.execute(
+      "SELECT uzytkownik_id FROM kierowcy WHERE uzytkownik_id = ?",
+      [driverId]
+    );
+    
+    if (driverCheck.length === 0) {
+      await connection.end();
+      return res.status(404).json({ message: "Kierowca nie znaleziony" });
+    }
+    
+    // Usuwamy tylko rekord kierowcy, nie konto użytkownika
+    await connection.execute(
+      "DELETE FROM kierowcy WHERE uzytkownik_id = ?", 
+      [driverId]
+    );
+    
+    await connection.end();
+    res.json({ message: "Dane kierowcy zostały usunięte" });
+  } catch (err) {
+    console.error("Błąd podczas usuwania kierowcy:", err);
+    res.status(500).json({ message: "Błąd serwera" });
+  }
+});
+
+// Usuń recenzję kierowcy
+app.delete("/admin/reviews/:id", authenticateToken, authorizeRole(1), async (req, res) => {
+  try {
+    const reviewId = req.params.id;
+    const connection = await connectDB();
+    
+    // Najpierw sprawdź czy recenzja istnieje
+    const [reviewCheck] = await connection.execute(
+      "SELECT id, kierowca_id FROM oceny_kierowcow WHERE id = ?",
+      [reviewId]
+    );
+    
+    if (reviewCheck.length === 0) {
+      await connection.end();
+      return res.status(404).json({ message: "Recenzja nie znaleziona" });
+    }
+    
+    // Zapisz ID kierowcy przed usunięciem recenzji do późniejszej aktualizacji średniej oceny
+    const kierowcaId = reviewCheck[0].kierowca_id;
+    
+    // Usuń recenzję
+    await connection.execute(
+      "DELETE FROM oceny_kierowcow WHERE id = ?", 
+      [reviewId]
+    );
+    
+    // Zaktualizuj średnią ocenę kierowcy
+    await connection.execute("CALL UpdateDriverRating(?)", [kierowcaId]);
+    
+    await connection.end();
+    res.json({ message: "Recenzja została usunięta" });
+  } catch (err) {
+    console.error("Błąd podczas usuwania recenzji:", err);
+    res.status(500).json({ message: "Błąd serwera" });
+  }
+});
+//--------------------------------------------------------------------------------------------------------------------- Koniec zmian Ranking CRUD
