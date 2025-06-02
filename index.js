@@ -68,6 +68,10 @@ async function encryptData(data) {
   return { iv: Array.from(iv), data: Array.from(new Uint8Array(encrypted)) };
 }
 
+app.get('/health', (req, res) => {
+  res.status(200).send('OK');
+});
+
 // app.get('/users', async (req, res) => {
 //   try {
 //     const connection = await connectDB();
@@ -117,7 +121,7 @@ const does_user_exist = async (email) => {
 //============REGISTER======================
 
 // Importuj modele Sequelize (dodaj na początku pliku, po innych importach)
-const User = require("./models/user");
+const User = require("./models/User");
 const Role = require("./models/Role");
 const UserRole = require("./models/UserRole");
 const sequelize = require('./models/Config');
