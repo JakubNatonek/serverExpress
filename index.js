@@ -68,10 +68,6 @@ async function encryptData(data) {
   return { iv: Array.from(iv), data: Array.from(new Uint8Array(encrypted)) };
 }
 
-app.get('/health', (req, res) => {
-  res.status(200).send('OK');
-});
-
 // app.get('/users', async (req, res) => {
 //   try {
 //     const connection = await connectDB();
@@ -121,7 +117,7 @@ const does_user_exist = async (email) => {
 //============REGISTER======================
 
 // Importuj modele Sequelize (dodaj na początku pliku, po innych importach)
-const User = require("./models/User");
+const User = require("./models/user");
 const Role = require("./models/Role");
 const UserRole = require("./models/UserRole");
 const sequelize = require('./models/Config');
@@ -1945,3 +1941,48 @@ app.delete("/admin/reviews/:id", authenticateToken, authorizeRole(1), async (req
   }
 });
 //--------------------------------------------------------------------------------------------------------------------- Koniec zmian Ranking CRUD
+//--------------------------------------------------------------------------------------------------------------------- Początek zmian Odświeżanie tokenu
+// Dodaj w endpoincie refresh-token
+app.post("/refresh-token", authenticateToken, async (req, res) => {
+  try {
+    // Pobierz informacje o użytkowniku z tokenu
+    const userId = req.user.id;
+    const email = req.user.email;
+    const roleId = req.user.roleId;
+    
+    //console.log(`[${new Date().toISOString()}] Odświeżanie tokenu dla użytkownika: ${email} (ID: ${userId})`);
+    
+    // Sprawdź, czy użytkownik nadal istnieje w bazie danych
+    const connection = await connectDB();
+    const [userRows] = await connection.execute(
+      'SELECT * FROM uzytkownicy WHERE id = ?',
+      [userId]
+    );
+    
+    if (userRows.length === 0) {
+      await connection.end();
+      //console.log(`[${new Date().toISOString()}] Nieudane odświeżenie tokenu - użytkownik nie istnieje: ${email}`);
+      return res.status(404).json({ message: "Użytkownik nie istnieje" });
+    }
+    
+    // Wygeneruj nowy token
+    const newToken = generateToken(email, roleId, userId);
+    await connection.end();
+    
+    // Dekoduj nowy token aby poznać jego datę wygaśnięcia
+    const decoded = jwt.verify(newToken, JWT_SECRET);
+    const expirationTime = new Date(decoded.exp * 1000).toISOString();
+    
+    //console.log(`[${new Date().toISOString()}] Token odświeżony dla ${email}, wygaśnie: ${expirationTime}`);
+    
+    // Zwróć nowy token
+    res.json({ 
+      message: "Token został odświeżony",
+      token: newToken 
+    });
+  } catch (error) {
+    console.error(`[${new Date().toISOString()}] Błąd podczas odświeżania tokenu:`, error);
+    res.status(500).json({ message: "Wystąpił błąd serwera" });
+  }
+});
+//--------------------------------------------------------------------------------------------------------------------- Koniec zmian Odświeżanie tokenu
