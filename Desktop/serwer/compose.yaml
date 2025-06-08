@@ -1,0 +1,41 @@
+services:
+  backend:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - '8080:8080'
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+  db: 
+    image: mysql:9.3
+    ports:
+      - '3306:3306'
+    environment:
+      MYSQL_DATABASE: maxitaxi_baza
+      MYSQL_USER: myuser
+      MYSQL_PASSWORD: mypassword
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-prootpass"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+  frontend:
+    build: F:\Studia_letni_2025\BazyDanych\MaxiTaxi
+    depends_on:
+      - backend
+      - db
+    ports:
+      - '80:80'
+
+volumes:
+  mysql_data:
