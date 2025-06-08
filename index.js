@@ -8,7 +8,7 @@ const port = process.env.PORT || 8080;
 
 const cors = require("cors");
 app.use(cors()); //wszystko
-app.use(cors({ origin: "http://localhost:8100" })); //apka
+// app.use(cors({ origin: "http://localhost:80" })); //apka
 
 const jwt = require("jsonwebtoken"); // JSON web token -------------------
 
@@ -68,6 +68,8 @@ async function encryptData(data) {
   return { iv: Array.from(iv), data: Array.from(new Uint8Array(encrypted)) };
 }
 
+
+
 // app.get('/users', async (req, res) => {
 //   try {
 //     const connection = await connectDB();
@@ -113,11 +115,15 @@ const does_user_exist = async (email) => {
   }
 };
 
+// ===Docker===check====
+app.get('/health', (req, res) => {
+  res.status(200).send('OK');
+});
 
 //============REGISTER======================
 
 // Importuj modele Sequelize (dodaj na początku pliku, po innych importach)
-const User = require("./models/user");
+const User = require("./models/User");
 const Role = require("./models/Role");
 const UserRole = require("./models/UserRole");
 const sequelize = require('./models/Config');
@@ -509,13 +515,10 @@ app.post("/lokalizacja", authenticateToken, async (req, res) => {
 
 app.get("/bliscy/", authenticateToken, async (req, res) => {
   const user = req.user;
-  // const { iv, data } = req.body;
-  // const decryptedData = decryptData(iv, data);
-  // console.log(user)
-  // console.log(req)
   const uzytkownik_id = user.id;
-  const promien = 100; // domyślnie 5 km
-const query = `
+  const promien = 100; // domyślnie 100 km
+  
+  const query = `
     SELECT 
       l2.uzytkownik_id,
       u.imie AS imie_kierowcy,
@@ -523,6 +526,9 @@ const query = `
       k.nr_rejestracyjny,
       k.kolor_pojazdu,
       k.ocena,
+      l2.szerokosc_geo,       /* Dodane - współrzędna szerokości */
+      l2.dlugosc_geo,         /* Dodane - współrzędna długości */
+      l2.zaktualizowano,      /* Dodane - czas aktualizacji */
       (
         6371 * acos(
           cos(radians(l1.szerokosc_geo)) * 
@@ -539,17 +545,18 @@ const query = `
     JOIN rola_as_uzytkownik rau ON u.id = rau.uzytkownik_id
     WHERE l1.uzytkownik_id = ?
       AND rau.rola_id = 3 -- Tylko użytkownicy z rolą kierowca
+      AND l2.zaktualizowano >= DATE_SUB(NOW(), INTERVAL 5 MINUTE) /* Dodane - filtr 5 minut */
     HAVING dystans_km < ?
     ORDER BY dystans_km ASC
     LIMIT 10;
     `;
+    
   const connection = await connectDB();
   try {
     const [rows] = await connection.execute(query, [uzytkownik_id, promien]);
-    // console.log(rows);
     await connection.end();
     const data = await encryptData(rows);
-    res.json(data); // Zwraca listę: { uzytkownik_id, dystans_km }
+    res.json(data);
   } catch (err) {
     console.error(err);
     await connection.end();
@@ -684,6 +691,7 @@ app.get("/zlecenia", authenticateToken, async (req, res) => {
 
 app.put("/zlecenia/:id/status", authenticateToken, async (req, res) => {
   const zlecenieId = req.params.id; // ID zlecenia z parametru URL
+  const userId = req.user.id; // ID użytkownika z tokena
   const { iv, data } = req.body; // Odbieranie zaszyfrowanych danych
 
   if (!iv || !data) {
@@ -694,57 +702,92 @@ app.put("/zlecenia/:id/status", authenticateToken, async (req, res) => {
     // Deszyfrowanie danych
     const decryptedData = decryptData(iv, data);
     const { status_id } = decryptedData;
-    //console.log(decryptedData)
 
     if (!status_id) {
-      return res
-        .status(400)
-        .json({ message: "Brak statusu do zaktualizowania" });
+      return res.status(400).json({ message: "Brak statusu do zaktualizowania" });
     }
 
     const connection = await connectDB();
-    let query;
-    let params;
-
+    
     if (status_id === 3 || status_id === 4) {
-      query = `
-        UPDATE przejazdy
-        SET status_id = ?, data_zakonczenia = NOW()
-        WHERE id = ?
-      `;
-      params = [status_id, zlecenieId];
+      // Dla statusu "zakończony" lub "anulowany" ustawiamy datę zakończenia
+      try {
+        const [result] = await connection.execute(`
+          UPDATE przejazdy
+          SET status_id = ?, data_zakonczenia = NOW()
+          WHERE id = ?
+        `, [status_id, zlecenieId]);
+        
+        await connection.end();
+
+        if (result.affectedRows === 0) {
+          return res.status(404).json({ message: "Nie znaleziono zlecenia" });
+        }
+
+        res.status(200).json({ message: "Status zlecenia został zaktualizowany" });
+      } catch (err) {
+        console.error("Błąd podczas aktualizowania statusu zlecenia:", err);
+        await connection.end();
+        res.status(500).json({ message: "Błąd serwera" });
+      }
     } else if (status_id === 2) {
-      // Dla statusu "w trakcie" ustawiamy datę rozpoczęcia
-      query = `
-        UPDATE przejazdy
-        SET status_id = ?, data_rozpoczecia = NOW()
-        WHERE id = ?
-      `;
-      params = [status_id, zlecenieId];
+      // Rozpoczynamy transakcję dla wielu operacji
+      await connection.beginTransaction();
+      
+      try {
+        const kierowcaId = userId;
+        
+        // 2. Dla statusu "w trakcie" ustawiamy datę rozpoczęcia dla bieżącego przejazdu
+        await connection.execute(`
+          UPDATE przejazdy
+          SET status_id = ?, data_rozpoczecia = NOW()
+          WHERE id = ? AND status_id = 1
+        `, [status_id, zlecenieId]);
+        
+        // 3. Anuluj wszystkie inne oczekujące przejazdy (status_id = 1) tego kierowcy
+        await connection.execute(`
+          UPDATE przejazdy
+          SET status_id = 4
+          WHERE kierowca_id = ? 
+          AND status_id = 1
+          AND id != ?
+        `, [kierowcaId, zlecenieId]);
+        
+        // Zatwierdź wszystkie zmiany
+        await connection.commit();
+        await connection.end();
+        
+        return res.status(200).json({ 
+          message: "Status zlecenia został zaktualizowany, a inne oczekujące przejazdy anulowane" 
+        });
+      } catch (err) {
+        // W przypadku błędu wycofaj zmiany
+        await connection.rollback();
+        await connection.end();
+        console.error("Błąd podczas aktualizowania statusu:", err);
+        return res.status(500).json({ message: "Błąd serwera" });
+      }
     } else {
       // Dla pozostałych statusów - tylko zmiana statusu
-      query = `
-        UPDATE przejazdy
-        SET status_id = ?
-        WHERE id = ?
-      `;
-      params = [status_id, zlecenieId];
-    }
-    try {
-      const [result] = await connection.execute(query, [status_id, zlecenieId]);
-      await connection.end();
+      try {
+        const [result] = await connection.execute(`
+          UPDATE przejazdy
+          SET status_id = ?
+          WHERE id = ?
+        `, [status_id, zlecenieId]);
+        
+        await connection.end();
 
-      if (result.affectedRows === 0) {
-        return res.status(404).json({ message: "Nie znaleziono zlecenia" });
+        if (result.affectedRows === 0) {
+          return res.status(404).json({ message: "Nie znaleziono zlecenia" });
+        }
+
+        res.status(200).json({ message: "Status zlecenia został zaktualizowany" });
+      } catch (err) {
+        console.error("Błąd podczas aktualizowania statusu zlecenia:", err);
+        await connection.end();
+        res.status(500).json({ message: "Błąd serwera" });
       }
-
-      res
-        .status(200)
-        .json({ message: "Status zlecenia został zaktualizowany" });
-    } catch (err) {
-      console.error("Błąd podczas aktualizowania statusu zlecenia:", err);
-      await connection.end();
-      res.status(500).json({ message: "Błąd serwera" });
     }
   } catch (err) {
     console.error("Błąd dekodowania danych:", err);
