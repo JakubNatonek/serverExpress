@@ -68,20 +68,6 @@ async function encryptData(data) {
   return { iv: Array.from(iv), data: Array.from(new Uint8Array(encrypted)) };
 }
 
-
-
-// app.get('/users', async (req, res) => {
-//   try {
-//     const connection = await connectDB();
-//     const [rows] = await connection.execute('SELECT * FROM uzytkownicy');
-//     await connection.end();
-//     res.json(rows);
-//   } catch (err) {
-//     console.error('Error fetching data: ', err);
-//     res.status(500).send('Server Error');
-//   }
-// });
-
 const add_user = async (email, haslo_hash) => {
   const connection = await connectDB();
   const query = `
@@ -516,7 +502,7 @@ app.post("/lokalizacja", authenticateToken, async (req, res) => {
 app.get("/bliscy/", authenticateToken, async (req, res) => {
   const user = req.user;
   const uzytkownik_id = user.id;
-  const promien = 100; // domyślnie 100 km
+  const promien = 10; // domyślnie 10 km
   
   const query = `
     SELECT 
@@ -526,9 +512,9 @@ app.get("/bliscy/", authenticateToken, async (req, res) => {
       k.nr_rejestracyjny,
       k.kolor_pojazdu,
       k.ocena,
-      l2.szerokosc_geo,       /* Dodane - współrzędna szerokości */
-      l2.dlugosc_geo,         /* Dodane - współrzędna długości */
-      l2.zaktualizowano,      /* Dodane - czas aktualizacji */
+      l2.szerokosc_geo,
+      l2.dlugosc_geo,
+      l2.zaktualizowano,
       (
         6371 * acos(
           cos(radians(l1.szerokosc_geo)) * 
@@ -545,15 +531,22 @@ app.get("/bliscy/", authenticateToken, async (req, res) => {
     JOIN rola_as_uzytkownik rau ON u.id = rau.uzytkownik_id
     WHERE l1.uzytkownik_id = ?
       AND rau.rola_id = 3 -- Tylko użytkownicy z rolą kierowca
-      AND l2.zaktualizowano >= DATE_SUB(NOW(), INTERVAL 5 MINUTE) /* Dodane - filtr 5 minut */
+      AND l2.zaktualizowano >= DATE_SUB(NOW(), INTERVAL 5 MINUTE)
+      AND NOT EXISTS (
+        -- Wyklucz kierowców którzy mają aktywne zlecenie (status_id = 2) nie należące do tego użytkownika
+        SELECT 1 FROM przejazdy p 
+        WHERE p.kierowca_id = l2.uzytkownik_id 
+          AND p.status_id = 2
+          AND p.pasazer_id != ?
+      )
     HAVING dystans_km < ?
     ORDER BY dystans_km ASC
     LIMIT 10;
-    `;
+  `;
     
   const connection = await connectDB();
   try {
-    const [rows] = await connection.execute(query, [uzytkownik_id, promien]);
+    const [rows] = await connection.execute(query, [uzytkownik_id, uzytkownik_id, promien]);
     await connection.end();
     const data = await encryptData(rows);
     res.json(data);
