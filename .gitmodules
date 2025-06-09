@@ -1,0 +1,3 @@
+[submodule "MaxiTaxi"]
+	path = MaxiTaxi
+	url = https://github.com/JakubNatonek/MaxiTaxi.git
